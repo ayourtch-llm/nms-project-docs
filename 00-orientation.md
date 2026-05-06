@@ -104,10 +104,25 @@ Acton is actor-based. The code uses `actor` for things-with-state:
 - `actor Layer(...)` — owns a `ttt.Layer` instance
 - `actor Session(...)` — a transactional view into a stack of layers (open one with `layer.newsession()`, then `edit_config(...)` / `commit()`)
 - `actor DeviceRegistry(...)` — singleton-per-app registry mapping device name → `DeviceMgr` actor
-- `actor DeviceMgr(...)` — per-device state machine (running config, target config, txid, adapter)
+- `actor DeviceMgr(...)` — per-device state machine (running config, target config, txid, adapter). Delegates protocol-specific work to a `DeviceAdapter` (`NetconfAdapter`, `MockAdapter`, ...); modules that drive devices typically interact with `DeviceMgr`'s public surface (`configure`, `rpc_xml`, `fetch_config`, `declare_subscriptions`) and don't reach into the adapter directly.
 - `actor NetconfDriver(...)` / `NetconfAdapter` — wraps the NETCONF session
 
 Communication is async; callbacks are typed `action(...)`. There is no shared mutable state across actors.
+
+### Operational state and the observer-transform pattern
+
+Most stratoweave transforms produce *downward config* — the input tree is transformed into the next-layer-down tree. But there is a second important pattern: a transform that produces **no downward config**, instead consuming an input config tree and publishing **operational state** (status, plan, telemetry, anything not user-written). sw-install fits this shape — the user writes a desired pack assignment; the module publishes request status, plan, and run-log as oper data.
+
+The platform supports this via `TransformActorParams` (`stratoweave/ttt.act`), which gives a transform's `act`-spawned actor four handles:
+
+- **`update_oper(?gdata.Node)`** — publishes oper-data tree merged into the transform's output. Read by `Layer.get_data(...)` callers (RESTCONF, CLI tools, other transforms).
+- **`update_dynstate(?gdata.Node)`** — persists actor-private state via lmdb, restored on platform startup. The runner's source of truth.
+- **`dev: ?swdev.DeviceMgr`** — for RFS transforms; lets the actor talk to the device.
+- **`lower: ?Layer`** — read-only access to the layer below; supports `declare_subscriptions(...)` for observing data outside the transform's local input.
+
+A working example is `sorespo/src/sorespo/rfs.act:BBInterfaceTransform` — a per-list-entry transform whose actor uses `update_oper` to publish telemetry and `update_dynstate` to persist accumulated counters across restarts. sw-install follows the same shape, attached at `/devices/device/<name>/software-pack/`, with one transform instance per device.
+
+`transform_wrapper(cfg, linked, memory, dynstate)` returns `(downward_config_diff, new_memory)`. For an observer-shaped module, `downward_config_diff` is empty (`gdata.Container()`) — the transform mechanism still gives access to all the auxiliary services. `memory` is also typically unused for observer-shaped modules; everything goes in `dynstate`.
 
 ### Persistence
 
