@@ -156,6 +156,16 @@ These survive v3 unmodified.
 
 ---
 
+## Phase numbering — note for v3 design
+
+The user reorganized phases mid-iteration:
+
+- **Phase 4** (current): skeleton + first OS (SROS), NETCONF-only.
+- **Phase 5** (new): TextFSMPlus port to acton-utils textfsm + `DeviceOps` CLI strategy implementations + `FileTransfer` byte-mover (SCP/SFTP/device-pull). All the "make CLI/SSH/SCP infrastructure real" work in one coherent phase.
+- **Phase 6** (was Phase 5): Cisco IOS-XR + Junos per-OS step modules using the Phase 5 infrastructure, plus IOS-XR's controller-side iso/tar archive parsing dependency, and final polish (REUSE/license sweep, end-to-end mock integration tests, documentation).
+
+References to "Phase 5" in this integration doc above mean the new Phase 5 (TextFSMPlus + FileTransfer infrastructure).
+
 ## Round-3 expectation
 
 After v3 lands:
