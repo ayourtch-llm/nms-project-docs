@@ -120,9 +120,11 @@ The platform supports this via `TransformActorParams` (`stratoweave/ttt.act`), w
 - **`dev: ?swdev.DeviceMgr`** — for RFS transforms; lets the actor talk to the device.
 - **`lower: ?Layer`** — read-only access to the layer below; supports `declare_subscriptions(...)` for observing data outside the transform's local input.
 
-A working example is `sorespo/src/sorespo/rfs.act:BBInterfaceTransform` — a per-list-entry transform whose actor uses `update_oper` to publish telemetry and `update_dynstate` to persist accumulated counters across restarts. sw-install follows the same shape, attached at `/devices/device/<name>/software-pack/`, with one transform instance per device.
+A working example is `sorespo/src/sorespo/rfs.act:BBInterfaceTransform` — a per-list-entry transform whose actor uses `update_oper` to publish telemetry and `update_dynstate` to persist accumulated counters across restarts. sw-install follows the same per-list-entry shape, attached inside the `/sw-rfs:rfs` list (the RFS-layer per-device list — same place sorespo's RFS transforms attach), with one transform instance per device. Note: sw-install uses **plain `ttt.Transform`**, not `RFSTransform` — sw-install produces no downward config and needs `params.lower` (not `params.dev`) for global-config subscription.
 
 `transform_wrapper(cfg, linked, memory, dynstate)` returns `(downward_config_diff, new_memory)`. For an observer-shaped module, `downward_config_diff` is empty (`gdata.Container()`) — the transform mechanism still gives access to all the auxiliary services. `memory` is also typically unused for observer-shaped modules; everything goes in `dynstate`.
+
+Transforms can also subscribe to data **outside their local input** via `params.lower.declare_subscriptions(...)` — this is how, for example, sw-install's per-device runner reads the global `/software-install/...` config that lives elsewhere in the layer stack. (See `ttt.act:735` — `Layer.declare_subscriptions`.)
 
 ### Persistence
 

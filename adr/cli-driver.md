@@ -139,8 +139,10 @@ Lifting it here preserves the design intent — including the user's specific di
 The Phase 4 design and code must:
 
 - ✅ Ship the `DeviceOps` boundary (§9.7 of `02-sw-install-design.md`) so step signatures already accommodate CLI strategy.
-- ✅ Ship per-OS `Ops` modules (e.g. `ops_sros.act`) with NETCONF strategy real and CLI strategy stubs raising `NotImplementedError`.
+- ✅ Ship per-OS `Ops` modules (e.g. `ops_sros.act`) with NETCONF strategy real and a `cli_session: ?CliSession` field. **No per-method CLI stubs raising `NotImplementedError`** — Phase 4 doesn't select the CLI strategy, so per-method stubs would be dead surface that increases test burden without delivering behavior.
 - ✅ Ship the `cli_session_factory: ?proc(...)` parameter on `make_sw_install_transform`.
 - Not invent a parallel CLI mechanism that Phase 5 would have to migrate away from.
+
+Phase 5 then adds CLI strategy methods alongside the existing NETCONF ones inside the per-OS `Ops` actor; the `DeviceOps` facade signature doesn't change.
 
 If Phase 5 picks up these handoffs cleanly, the boundary chosen in Phase 4 is correct.
