@@ -2,6 +2,15 @@
 
 This doc gets you (Andrew) and any other reader onto the same page about **what we're building**, **what we're building it inside of**, and **what we're building it from**. If you read just one doc before joining a conversation about this project, read this one.
 
+> **Reading order for the full doc set:**
+> 1. `docs/00-orientation.md` (this doc) — project context + stratoweave concepts
+> 2. `docs/01-software-install-logic.md` — language-agnostic spec extracted from the Python source
+> 3. `docs/02-sw-install-design.md` — proposed Acton module design (current: v5)
+> 4. `docs/adr/cli-driver.md` — Phase 5 CLI driver design intent
+> 5. `stratoweave/sw-install/src/sw_install/yang.act` — the v5 YANG model
+>
+> Reviews and integration docs live under `docs/reviews/` for historical reference.
+
 ---
 
 ## TL;DR
@@ -101,7 +110,7 @@ The point: **typos in YANG paths become compile errors**, not 3 a.m. pages.
 
 Acton is actor-based. The code uses `actor` for things-with-state:
 
-- `actor Layer(...)` — owns a `ttt.Layer` instance
+- `actor Layer(...)` (defined in `ttt.act`) — the per-layer actor that owns a tree node, accepts `edit_config`, and runs transforms
 - `actor Session(...)` — a transactional view into a stack of layers (open one with `layer.newsession()`, then `edit_config(...)` / `commit()`)
 - `actor DeviceRegistry(...)` — singleton-per-app registry mapping device name → `DeviceMgr` actor
 - `actor DeviceMgr(...)` — per-device state machine (running config, target config, txid, adapter). Delegates protocol-specific work to a `DeviceAdapter` (`NetconfAdapter`, `MockAdapter`, ...); modules that drive devices typically interact with `DeviceMgr`'s public surface (`configure`, `rpc_xml`, `fetch_config`, `declare_subscriptions`) and don't reach into the adapter directly.
@@ -125,6 +134,17 @@ A working example is `sorespo/src/sorespo/rfs.act:BBInterfaceTransform` — a pe
 `transform_wrapper(cfg, linked, memory, dynstate)` returns `(downward_config_diff, new_memory)`. For an observer-shaped module, `downward_config_diff` is empty (`gdata.Container()`) — the transform mechanism still gives access to all the auxiliary services. `memory` is also typically unused for observer-shaped modules; everything goes in `dynstate`.
 
 Transforms can also subscribe to data **outside their local input** via `params.lower.declare_subscriptions(...)` — this is how, for example, sw-install's per-device runner reads the global `/software-install/...` config that lives elsewhere in the layer stack. (See `ttt.act:735` — `Layer.declare_subscriptions`.)
+
+#### Quick reference: where data lives
+
+| Surface | What it is | Mutability | Persisted? |
+|---------|-----------|------------|-----------|
+| **Config (gdata)** | User-authored input to the layer (or transformed-into-this-layer from above). The transform's `cfg` arg comes from here. | external read/write | by the platform (lmdb) |
+| **Memory (gdata)** | Per-transform persistent state, returned from `transform_wrapper` as the second return value. Visible to subsequent calls of the same transform's `transform_wrapper`. | transform-internal (returns shape it) | by the platform (lmdb, ATTR_MEMORY) |
+| **Dynstate (gdata)** | Per-transform actor-private state, written via `update_dynstate(...)`. Visible to `transform_wrapper` as the fourth arg. Doesn't currently flow to the actor at restore time without a workaround (see sw-install design §3.6). | actor-internal (writes via update_dynstate) | by the platform (lmdb, ATTR_DYNSTATE) |
+| **Oper (gdata)** | Operational state published via `update_oper(...)` and read by `Layer.get_data(...)` callers. Pure projection of dynstate (or computed view). | external read-only | NOT persisted; rebuilt on restart |
+
+Most transforms use `cfg` and `memory`. Observer-shaped modules like sw-install lean heavily on dynstate + oper and barely touch memory.
 
 ### Persistence
 

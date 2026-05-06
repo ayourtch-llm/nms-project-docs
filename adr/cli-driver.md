@@ -2,6 +2,17 @@
 
 > **Status: Phase 5 design intent. Lifted from `docs/02-sw-install-design.md` v2 §9.7 per round-2 reviewer guidance — both reviewers said the §9.7 content was too detailed/committal for a Phase 4 design doc, and recommended an ADR.**
 
+## What Phase 4 commits to (so Phase 5 can build on it)
+
+- **`DeviceOps` facade** in `02-sw-install-design.md` §9.7 — per-OS facade that hides NETCONF/CLI strategy choice from steps. Step signatures take `ops: DeviceOps`.
+- **`SrosOps` carries a `cli_session: ?CliSession` field** — Phase 4 constructs with `None` (NETCONF only). **No per-method CLI stubs that raise NotImplementedError** — that would be dead surface; Phase 5 adds CLI methods alongside existing NETCONF ones inside `SrosOps`.
+- **`cli_session_factory: ?proc(...)` parameter** on `make_sw_install_transform` — Phase 4 accepts it, ignores when None.
+- **`RunLogHandler` honors `swi_redacted=True`** in structured-data dicts — Phase 5 transcript redaction will use this hook so secrets in CLI templates don't pollute the persistent run-log.
+
+If Phase 5 picks up these handoffs cleanly, the boundary chosen in Phase 4 is correct.
+
+## Context
+
 This document captures the design intent for sw-install's CLI driver, to be implemented in Phase 5. It depends on a parallel platform workstream (the acton-utils textfsm extension) that itself isn't yet built. Phase 4 of sw-install ships the **`DeviceOps` boundary** (see `02-sw-install-design.md` §9.7) so step signatures already accommodate the future CLI strategy; everything below is the implementation-side intent that informs Phase 5.
 
 ## Context
