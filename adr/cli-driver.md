@@ -15,8 +15,6 @@ If Phase 5 picks up these handoffs cleanly, the boundary chosen in Phase 4 is co
 
 This document captures the design intent for sw-install's CLI driver, to be implemented in Phase 5. It depends on a parallel platform workstream (the acton-utils textfsm extension) that itself isn't yet built. Phase 4 of sw-install ships the **`DeviceOps` boundary** (see `02-sw-install-design.md` §9.7) so step signatures already accommodate the future CLI strategy; everything below is the implementation-side intent that informs Phase 5.
 
-## Context
-
 The Python `software_install_script.py` mixes three transports per OS:
 - **NETCONF** — most state queries, install/activate/commit RPCs.
 - **CLI** — interactive commands like `admin reboot now`, `request system reboot`, `[confirm]`-style prompts, and some show-command output scraping.
