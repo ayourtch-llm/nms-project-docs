@@ -5,7 +5,7 @@ This doc gets you (Andrew) and any other reader onto the same page about **what 
 > **Reading order for the full doc set:**
 > 1. `docs/00-orientation.md` (this doc) — project context + stratoweave concepts
 > 2. `docs/01-software-install-logic.md` — language-agnostic spec extracted from the Python source
-> 3. `docs/02-sw-install-design.md` — proposed Acton module design (current: v5.3.2 — locked in for Phase 4 implementation)
+> 3. `docs/02-sw-install-design.md` — proposed Acton module design (current: v5.3.3 — locked in for Phase 4 implementation; fully self-contained for a fresh reader)
 > 4. `docs/adr/cli-driver.md` — Phase 5 CLI driver design intent
 > 5. `stratoweave/sw-install/src/sw_install/yang.act` — the v5 YANG model
 >

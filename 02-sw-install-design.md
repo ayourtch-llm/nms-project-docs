@@ -1,6 +1,6 @@
-# 02 — Stratoweave `software-install` Module Design (v5.3.2 — self-contained)
+# 02 — Stratoweave `software-install` Module Design (v5.3.3 — fully self-contained)
 
-> **Status: v5.3.2 — locked in after 8 review rounds (HIGH count 6 → 5 → 3+3 → 2+2 → 1+1 → 0+0). v5.3.2 is a content-only readability pass: the 14 sections that earlier revisions had shortened to "(unchanged)" placeholders are now inlined with full prose so the doc stands alone for a fresh reader without git-diving. No semantic changes vs v5.3.1; the architecture, algorithms, and decisions are identical.**
+> **Status: v5.3.3 — locked in after 9 review rounds (HIGH count 6 → 5 → 3+3 → 2+2 → 1+1 → 0+0; r9 confirmed no semantic drift, flagged residual placeholder pointers). v5.3.2 inlined 14 placeholder sections; v5.3.3 finishes the job by inlining the four remaining "(carried/unchanged)" pointers (§4.3 confirm-step body, §4.7 enabled state-transition table, §4.8 full YANG diff baseline, §10 testing strategy bullets, §11 Phase 4 sequence). No semantic changes vs v5.3.1; the architecture, algorithms, and decisions are identical. The doc now stands alone for a fresh reader without git-diving.**
 
 > **No platform-side prerequisites required for Phase 4 implementation** (down from v4's "platform addition required"). v5 promoted the `transform_wrapper`-stash dynstate-restore path to primary because actor construction runs before `Layer.load_from_db()` in the live lifecycle — so the originally-proposed `TransformActorParams.dynstate` field would be `None` at construction even if added. The stash path leverages the existing post-restore recompute and works without platform changes. See §3.6.
 
@@ -447,11 +447,29 @@ This is the round-6 codex H1 / claude r5 H1 idempotency story made concrete.
 
 🆕 The third clause is the v5 fix per CR4_5: without it, restart could repeatedly auto-start because there's no `start-generation` to consume. v5 sets `auto_started_after_confirm = true` (Tier A) before the auto-start side effect; subsequent restarts see it set and skip.
 
-### 4.3 `confirm-step` ↔ writeable confirmations (🆕 CL4_4 sentinel)
+### 4.3 `confirm-step` ↔ writeable confirmations under `control/` (🆕 CL4_4 sentinel)
 
-(Unchanged shape from v4.)
+Per-step confirmations live in config under `control/`:
 
-🆕 **`confirm-all-generation` `by-user` value:** when triggered by `confirm-all-generation` (no operator-supplied `by-user` in the trigger), the runner stamps `confirmed.by-user = "<confirm-all>"` in the oper projection. Operationally legible; RESTCONF-friendly.
+```yang
+container control {
+    list confirmation {
+        key "request-id component step";
+        leaf request-id { type uint32; }
+        leaf component { type string; }
+        leaf step { type string; }
+        leaf by-user { type string; }
+    }
+    leaf confirm-all-generation { type uint64; default 0; }
+    // ... see §4.6 for the full list of generation/target leaves
+}
+```
+
+When the runner reaches a step in `waiting-confirmation` and a matching `confirmation` exists in config, the step proceeds. The runner stamps `confirmed.{by-user, when}` in the oper projection.
+
+`confirm-all-generation` increment expands internally to confirmations for every step of the targeted request (see §4.6 scoping).
+
+🆕 **`confirm-all-generation` `by-user` value (CL4_4 sentinel):** when triggered by `confirm-all-generation` (no operator-supplied `by-user` in the trigger), the runner stamps `confirmed.by-user = "<confirm-all>"` in the oper projection. Operationally legible; RESTCONF-friendly.
 
 ### 4.4 `cancel-request` — drain comparison fix (🆕 CL4_6)
 
@@ -469,19 +487,42 @@ Complements (does not replace) the bounded ring buffer (§6.6).
 
 🆕 **Single-slot `last-trigger-result` is documented as not suitable for high-throughput automation polling** (per CL4_5). Per-call audit lives in the run-log: the runner emits a swi_*-tagged log entry on every trigger consumption. v2.0 enhancement: widen to a small ring of last 5 results.
 
-### 4.7 `enabled` state machine — inter-step gate (🆕 CL4_7 M2)
+### 4.7 `enabled` state machine — state transition table + inter-step gate (🆕 CL4_7 M2)
 
-🆕 v5 §8.3 (re-entrancy invariants) adds invariant 4: **"between steps, the runner re-checks `enabled` and `dynstate.current.status` (cancelling, terminal); if either disqualifies continuation, transitions cooperatively."** §8 run-loop sketch shows this gate.
+`/software-install/enabled` is the master switch. Effects:
 
-(Rest of v4 §4.7 carried unchanged.)
+| `enabled` transition | Current request status | New request status | Action |
+|----------------------|------------------------|--------------------|--------|
+| `true → false` | `unprocessed` | `unprocessed` | nothing in flight; new requests still materialize, but won't start |
+| `true → false` | `processing` | `paused` | `generation_token` bumps (stales out in-flight callbacks); current step's RPC may still complete (best-effort cooperative pause); no further steps execute |
+| `true → false` | `failed-transient` (mid-backoff, `next_wake_at` set) | `paused` | `next_wake_at` retained; backoff doesn't fire while disabled |
+| `true → false` | `waiting-confirmation` / `cancelling` / terminal | unchanged | nothing to pause |
+| `false → true` | `paused` | `processing` (if `start-generation` was already consumed for this request) OR `unprocessed` (if not) | resume per-policy |
+| `false → true` | other | unchanged | normal triggers apply |
+
+**Disabled-then-cancel:** cancel still works while `enabled = false`. `cancelling → cancelled` once any in-flight RPC drains.
+
+🆕 **Inter-step gate (CL4_7 M2):** v5 §8.3 (re-entrancy invariants) adds invariant 4: **"between steps, the runner re-checks `enabled` and `dynstate.current.status` (cancelling, terminal); if either disqualifies continuation, transitions cooperatively."** §8 run-loop sketch shows this gate.
 
 ### 4.8 YANG diff vs Python (🆕 D7 scp-port placement back to nested)
 
+Full baseline carried from v3, with v5 overrides marked 🆕:
+
 | Item | v5 plan |
 |------|---------|
-| (carry v4 entries unchanged unless noted) | |
-| 🆕 `scp-port` placement | **Inside** `/sw-rfs:rfs[name]/software-pack/scp-port` (nested, NOT sibling). Per CR4_1 D7: the v4 sibling placement made scp-port invisible to the runner. The "survives unbinding the pack" benefit was speculative. Reverting to nested loses that benefit; gains: the runner can read it directly. |
-| 🆕 `runner-status` | New oper enum under `software-pack/`: `{starting, ok, missing-global-config, restore-inconsistent, paused-by-enabled, waiting-for-device}`. |
+| `software-pack` list (global) | unchanged |
+| `software-install-matrix` | dropped from YANG; not modelled in Acton; re-add only if a real use case surfaces (CL_R2_12) |
+| `confirm-steps`, `auto-execute-after-confirm`, `error-handling/...` | unchanged |
+| `request-status` enum | **add `paused`, `cancelling`, `waiting-for-device`** (§4.4, §4.7, CL_R2_10) |
+| `request[]` and below | **all `config false`** (oper-only); confirmations live in `control/confirmation` |
+| 🆕 `scp-port` placement (D7 override of v3/v4) | **Inside** `/sw-rfs:rfs[name]/software-pack/scp-port` (nested, NOT sibling, NOT a direct device augment). Per CR4_1 D7: the v4 sibling placement made `scp-port` invisible to the runner. The "survives unbinding the pack" benefit was speculative. Reverting to nested loses that benefit; gains: the runner can read it directly. |
+| 🆕 per-device `/sw-rfs:rfs[name]/software-pack/control/` subtree | **new** — generation counters + target-ids + confirmations + per-request options (per §4.6) |
+| 🆕 per-device `/sw-rfs:rfs[name]/software-pack/last-create-result` | oper-only feedback for create-request (per §3.4) |
+| 🆕 per-component `internal-state` leaf | **dropped** (CL14) — replaced by typed diagnostic projections (§3.4) |
+| Action nodes | **all dropped** — covered by reactive triggers + control surface |
+| `vrp` enum value | **kept** (A9) — `ValidatePlatform` fails cleanly on unsupported |
+| 🆕 `run-log` key | `(when, seq)` — sequence number breaks microsecond-collision ties (CR10) |
+| 🆕 `runner-status` (round-6 A5) | new oper enum under `software-pack/`: `{starting, ok, missing-global-config, restore-inconsistent, paused-by-enabled, waiting-for-device}`. |
 
 ---
 
@@ -1215,7 +1256,17 @@ Phase 4: `SrosOps` is constructed with `cli_session = None`. NETCONF strategy me
 
 ## 10. Testing strategy
 
-(Mostly carried from v3.)
+Following stratoweave's existing test conventions:
+
+- `test_pack.act` — value tests; equality/hashing/from_gdata round-trips.
+- `test_plan.act` — **plan refresh monotonicity, after-every-step trigger, next-step jump targets (incl. "target not in plan" → FAILURE), flush-only-if-not-FAILURE invariant, status mapping (consecutive counters), retry exhaustion per-class**.
+- `test_state.act` — per-OS `reset()` semantics; Junos `dual_re` cross-run invariant.
+- `test_runlog.act` — bounded retention, dropped-count, `(when, seq)` keying, `swi_component` filter, `clear-run-log-generation` semantics (including reset of `run_log_dropped` and per-request `seq`, per §4.5).
+- `test_dynstate.act` — restore-after-crash scenarios: `processing → failed-transient`, `cancelling → cancelled`, generation-token consumption, backoff resume, `materialized_by_request_generation` idempotency anchor (per §4.1).
+- `test_step_runner.act` — actor integration with `MockAdapter`; scripted SROS install end-to-end; **stale-callback no-op via generation token** (`stale_token < current.generation_token`, per §4.4), `on_local_config` re-entrancy idempotency (call twice, observe single action).
+- `test_sros.act` — per-step tests against a mock NETCONF server.
+- `test_remote_file_sros.act` — `RemoteFileInspector` SROS impl tests (NETCONF `<file><list>`).
+- `test_local_file.act` — `LocalFileInspector` tests with temp files.
 
 🆕 v5.2 (per round-6 A5): **`test_topology_misconfigured.act` is a required Phase 4 test.** Builds a layer stack where `/software-install/` is NOT passed through to the layer below the sw-install transform; asserts the runner reaches `runner-status = missing-global-config` after `MISSING_GLOBAL_CONFIG_GRACE` (15s), even with a valid pack assignment in local config. Serves as the regression guard against app-integration mistakes — the only "operator can shoot foot" surface in the design. Should also serve as a copy-paste template for app integrators showing the correct vs incorrect topologies side by side.
 
@@ -1223,9 +1274,22 @@ Phase 4: `SrosOps` is constructed with `cli_session = None`. NETCONF strategy me
 
 ## 11. Implementation phasing within Phase 4 (🆕 D5 unblocks)
 
-**🆕 v5 has NO platform prerequisites for Phase 4.** Implementation can begin immediately on the existing platform.
+**🆕 v5 has NO platform prerequisites for Phase 4.** Implementation can begin immediately on the existing platform (per §3.6 D3b transform_wrapper-stash mechanism + §9.5 `DeviceMgr.get_dmc()` already at `device.act:401`).
 
-(Otherwise unchanged.)
+Sequence within Phase 4:
+
+1. **Skeleton + revised YANG** (`yang.act` covering `control/` subtree per §4.6, `scp-port` nested-inside-`software-pack` per §4.8 D7, generation+target leaves, `paused`/`cancelling`/`waiting-for-device` enums, `runner-status` oper enum, `(when, seq)` run-log key).
+2. **Pure types** (`pack.act`, `state.act`, `plan.act`, `step.act`, `local_file.act`, `remote_file.act`, `file_transfer.act`, `ops.act`) — value types with full unit tests (`test_pack`, `test_plan`, `test_state`, `test_local_file`).
+3. **Transform + DeviceRunner skeleton** (`transform.act`, `device_runner.act`) — wires up the §3.6 transform_wrapper-stash dynstate handoff, `on_local_config` + `on_global_config` + reconciliation, no device interaction yet. Tests verify generation-counter consumption, `materialized_by_request_generation` idempotency, and `on_local_config` re-entrancy.
+4. **First step: `CheckFiles`** — uses `LocalFileInspector` only, no device interaction.
+5. **First device step: `CheckVersions` for SROS** — uses real `SrosOps` NETCONF strategy. Mock test against `MockAdapter`.
+6. **All SROS steps** in spec order, each with mock tests.
+7. **Mock-driven full-flow integration test:** scripted SROS upgrade end-to-end against a `MockAdapter` that scripts NETCONF + `RemoteFileInspector` responses (Phase 4 uses `NoopFileTransfer`; pre-staged-image path validated via `RemoteFileInspector` per §9.4).
+8. **Restart test:** kill mid-step, verify re-spawn from dynstate continues correctly (the §3.6 D3b ordering: actor `__init__` runs before `Layer.load_from_db`, so the stash mechanism handles dynstate handoff post-init).
+9. **Topology-misconfigured regression test** (`test_topology_misconfigured.act`, per §10) — verifies `runner-status = missing-global-config` after the 15s `MISSING_GLOBAL_CONFIG_GRACE` watchdog when `/software-install/` is not passed through.
+10. **Forced-cancellation test** — drive `cancel-generation`, verify `cancelling → cancelled` transition with the `stale_token < current.generation_token` watchdog (`CANCEL_DRAIN_TIMEOUT` 600s) per §4.4.
+
+Phase 4 done when: SROS Phase 4 `test_step_runner` end-to-end test passes against a `MockAdapter`, including a forced cancellation, a forced restart-mid-step scenario, and the topology-misconfigured regression test.
 
 ---
 
@@ -1317,7 +1381,9 @@ Things deliberately **not** in this design, captured here so future contributors
 
 ## 16. LOCK-IN
 
-v5.3.1 is the lock-in version. Round-8 review produced zero HIGH findings; both reviewers (codex r8, claude r8) independently surfaced the same 1 MED + 2 LOW items, all of which v5.3.1 lands. Both reviewers' verdict: **"Green-light Phase 4."** No further design iteration is warranted.
+v5.3.1 is the lock-in version (architecture-frozen). Round-8 review produced zero HIGH findings; both reviewers (codex r8, claude r8) independently surfaced the same 1 MED + 2 LOW items, all of which v5.3.1 lands. Both reviewers' verdict: **"Green-light Phase 4."** No further design iteration is warranted.
+
+**v5.3.2 and v5.3.3 are content-only readability passes** on top of the v5.3.1 lock-in. Round-9 review confirmed v5.3.2 had no semantic drift in its 14 inlined sections but flagged four remaining "(carried/unchanged)" pointers (§4.3, §4.7, §4.8, §10). v5.3.3 lifts those — plus §11 Phase 4 sequencing — so the document stands alone for a fresh reader. Architecture, algorithms, decisions, and reviewer green-light from r8 all carry forward unchanged.
 
 **Convergence trajectory across 8 review rounds (HIGH count, codex+claude):**
 ```
