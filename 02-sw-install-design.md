@@ -1,6 +1,6 @@
-# 02 — Stratoweave `software-install` Module Design (v5.2)
+# 02 — Stratoweave `software-install` Module Design (v5.3)
 
-> **Status: v5.2 — incorporates round-6 review feedback from `docs/reviews/15-codex-design-r6.md` and `docs/reviews/16-claude-design-r6.md`, integrated in `docs/reviews/17-integration-r6.md`. Both r6 reviewers explicitly converged on "green-light Phase 4 after v5.2 doc-only pass" with 2 HIGHs and 3 MEDIUMs identified independently. v5.2 lands those 10 items. Pending round-7 lock-in review.**
+> **Status: v5.3 — incorporates round-7 review feedback from `docs/reviews/18-codex-design-r7.md` and `docs/reviews/19-claude-design-r7.md`, integrated in `docs/reviews/20-integration-r7.md`. Both r7 reviewers' verdict: "green-light Phase 4 after these fixes." 1+1 HIGHs (different items: codex caught a §4.1 algorithm bug, claude caught a §7.2 stale snippet) plus a few small cleanups. Convergence trajectory across rounds: HIGH count 6 → 5 → 3+3 → 2+2 → 1+1. Pending round-8 lock-in.**
 
 > **No platform-side prerequisites required for Phase 4 implementation** (down from v4's "platform addition required"). v5 promoted the `transform_wrapper`-stash dynstate-restore path to primary because actor construction runs before `Layer.load_from_db()` in the live lifecycle — so the originally-proposed `TransformActorParams.dynstate` field would be `None` at construction even if added. The stash path leverages the existing post-restore recompute and works without platform changes. See §3.6.
 
@@ -121,7 +121,7 @@ Example layer topology:
         └─────────────────────────────────────────────────────────┘
 ```
 
-If the topology is wrong, the runner publishes `runner-status: missing-global-config` to oper after a 5-second startup window — operators get a fail-loud signal. See §7.2.
+If the topology is wrong, the runner publishes `runner-status: missing-global-config` to oper after `MISSING_GLOBAL_CONFIG_GRACE` (default 15s after runner construction) — operators get a fail-loud signal. See §7.2 for the exact algorithm.
 
 App side:
 
@@ -223,15 +223,24 @@ This catches **dynstate-blob internal inconsistency** (e.g., a partial dynstate 
 
 🆕 v5.1 changes the stash mechanism from "shared mutable field on `SwInstallTransform`" to "action ref pushed at the runner". Round-5 caught that v5's field-stash breaks actor isolation: `SwInstallTransform` is owned by `_TransformTransaction`'s actor (which writes the field via `transform_wrapper`), and the runner actor would read it from a different actor context. v5.1's action-ref push keeps everything inside actor message-passing.
 
-**Lifecycle ordering** (verified against `app.act:138-152` `StartupBootstrap._run` and `ttt.act` line 1942-1993):
+**Lifecycle ordering** (verified against `app.act:138-152` `StartupBootstrap._run`, `ttt.act` 1942-1993, and the `_List`/`ListState` per-list-entry construction path at `ttt.act:1232-1331`):
 
-1. `Layer(...)` rootgen constructs `SwInstallTransform` and calls `act(...)`. The runner is constructed **here**, before any restore. Runner starts with empty in-memory dynstate (`SwInstallDynstate.empty()`).
-2. During `act(...)`, the runner installs an action-ref `stash_cb` on the `SwInstallTransform` instance. (The function instance and the runner are constructed in the same lexical scope of the factory; both close over the holder that links them.)
-3. `Layer.load_from_db()` restores `_TransformTransaction.dynstate` from LMDB.
-4. `app.StartupBootstrap.recompute(force=True)` calls `transform_wrapper(cfg, linked, memory, dynstate)`. The `dynstate` argument is the restored value at this point.
-5. `transform_wrapper` invokes `self.stash_cb(dynstate)` — an action ref pointing at the runner. Acton dispatches the action to the runner's mailbox.
+🆕 **v5.3 prose correction (per round-7 claude r7 MED 1):** the per-list-entry `SwInstallTransform` is constructed when the list entry is materialized — NOT at `Layer(...)` rootgen time. There are two paths:
+
+- **Restored case:** during `Layer.load_from_db()` (`ttt.act:610-643`), the LMDB scan delivers `ATTR_KEYS` records first. Each `ATTR_KEYS` invocation triggers `_List.restore` → `ListState.recreate(key, leaves)` → `template(PathKey(...), lower)` → `_create_transform_node` → `_TransformTransaction.__init__` (which calls `function_factory(log_handler)`, constructing `SwInstallTransform` and appending to `fn_holder`) → `init_dynstate` queued to the Transaction actor → eventually `act(params)` runs and constructs the `DeviceRunner`. **The runner is born for restored entries during `load_from_db`, not at Layer construction.**
+- **Fresh case:** when the user's first `edit_config` creates the list entry via `ListState.acquire` (`ttt.act:1316-1331`), `template(...)` is invoked then. The runner is constructed at that moment with empty in-memory dynstate (no LMDB record exists for a fresh entry).
+
+In either case, the runner exists with `dynstate_initialized = False` before `transform_wrapper` first fires for that entry. The full ordering for a restored entry is:
+
+1. `Layer(...)` rootgen runs; the `_List`/`ListState` is constructed but no list entries are materialized yet.
+2. `Layer.load_from_db()` begins. ATTR_KEYS records replay; for each key:
+   - `_List.restore(key, ...)` → `ListState.recreate(key, leaves)` → `template(PathKey(...), lower)` constructs `SwInstallTransform` (via `function_factory`) and the `DeviceRunner` (via `act`).
+   - During `act`, the factory installs `fn.stash_cb = runner._stash_dynstate`.
+3. ATTR_DYNSTATE records replay; `_TransformTransaction.restore` populates `self.dynstate`.
+4. `app.StartupBootstrap.recompute(force=True)` calls `transform_wrapper(cfg, linked, memory, dynstate)`. The `dynstate` argument is the restored value.
+5. `transform_wrapper` invokes `self.stash_cb(dynstate)` — action dispatched to runner's mailbox.
 6. `_TransformTransaction.finalize` calls `function.on_conf(self.get(), self.memory)` if `self.running` is non-empty. This is the runner's `on_local_config`.
-7. The runner has now received both the dynstate (via stash_cb) and the first config (via on_local_config). It applies the dynstate, runs the §3.5 consistency check, and begins reconciliation.
+7. Both `_stash_dynstate(dynstate)` and `on_local_config(cfg, mem)` are now in the runner's mailbox in FIFO order. Runner processes `_stash_dynstate` first (initializes dynstate, runs §3.5 consistency check), then `on_local_config` (begins reconciliation).
 
 **Code shape:**
 
@@ -269,9 +278,9 @@ actor DeviceRunner(
     var dynstate_initialized: bool = False
 
     action def _stash_dynstate(stashed: ?gdata.Node):
-        # Called by SwInstallTransform.transform_wrapper during the post-restore
-        # recompute. May be called with stashed=None for the empty-restore path
-        # via _signal_no_restore (see §3.6.1 below).
+        # Called by SwInstallTransform.transform_wrapper during the post-
+        # restore recompute. May be called with stashed=None for the empty-
+        # restore case (no LMDB record exists) — see §3.6.1.
         if stashed is not None:
             self.dynstate = SwInstallDynstate.from_gdata(stashed)
         self.dynstate_initialized = True
@@ -283,7 +292,7 @@ actor DeviceRunner(
         # (transform_wrapper runs first, then on_conf via finalize). Acton's
         # actor mailbox is FIFO, so dynstate_initialized is guaranteed True
         # by the time on_local_config processes — no fallback needed.
-        # The empty-restore path is handled via _signal_no_restore (§3.6.1).
+        # The empty-restore path uses _stash_dynstate(None) per §3.6.1.
         # ... reconciliation ...
 ```
 
@@ -292,6 +301,8 @@ actor DeviceRunner(
 When the platform restores no dynstate (fresh install or first boot), `_TransformTransaction.dynstate` is `None`. `transform_wrapper` is still called during the forced recompute (with `dynstate=None`), and the stash mechanism passes `None` into `_stash_dynstate(stashed=None)`. The runner treats this as "fresh install — empty dynstate is correct" and sets `dynstate_initialized = True` without restoring.
 
 This means `_stash_dynstate` is **always called** before any `on_local_config`, regardless of whether dynstate was actually restored. FIFO mailbox ordering then guarantees `dynstate_initialized == True` when `on_local_config` processes — no race, no fallback needed.
+
+🆕 **Note on integration A4 deviation (v5.3 per round-7 LOW 1):** the round-6 integration recommended a separate `_signal_no_restore()` action for the empty-restore case. v5.2 instead overloads `_stash_dynstate(stashed=None)` for both restored-but-empty and never-persisted cases. The two are functionally indistinguishable to the runner (both lead to `SwInstallDynstate.empty()`), and a single entry point eliminates any risk of the two signals racing past each other in the mailbox. The simpler form is correct for v5.2's use case.
 
 **Caveat (per claude r5 §A1):** if `_TransformTransaction.finalize` skips `on_conf` because `self.running` is empty (no `software-pack` has ever been authored for this device), the runner stays in `runner-status = starting` indefinitely. This is the no-software-pack-bound steady-state — benign (there's nothing to do). Operators should treat `starting` plus an empty `request[]` list as "no work configured" rather than "failure to initialize." Documented in §7.2.
 
@@ -361,28 +372,35 @@ action def _reconcile_create_request(local_cfg: gdata.Node, global_cfg: GlobalSw
 
     cfg_request_gen = local_cfg.get_leaf("control/request-generation") or 0
 
-    # ── Idempotency check 1: already materialized for this request-generation? ────
-    if (self.dynstate.current is not None and
-        cfg_request_gen > 0 and
-        self.dynstate.current.materialized_by_request_generation == cfg_request_gen):
-        # Crash-recovery short-circuit: the current request was already
-        # materialized for this exact generation. No-op. Persists across
-        # restart because materialized_by_request_generation is in dynstate.
-        return
-
     # ── Trigger A: explicit request-generation increment ──
     if cfg_request_gen > self.dynstate.last_request_generation:
+        # 🆕 v5.3 (per round-7 codex H1): the idempotency short-circuit must
+        # ALSO require pack equality to fire — otherwise a pack change with
+        # the same request-generation gets suppressed. Crash-recovery anchor
+        # only applies when both the explicit-generation marker AND the
+        # pack data match; if either has moved, the trigger is genuinely new.
+        if (self.dynstate.current is not None and
+            self.dynstate.current.materialized_by_request_generation == cfg_request_gen and
+            target_pack == self.dynstate.last_pack_snapshot):
+            # Crash-recovery short-circuit: the current request was already
+            # materialized for this generation against this exact pack.
+            # No-op. Persists across restart because both fields are in
+            # dynstate.
+            return
         self._materialize_new_request(target_pack, materialized_by_gen=cfg_request_gen,
                                       cfg_local=local_cfg, global_cfg=global_cfg,
                                       reason="request-generation")
         # The materialization Tier-A-batches:
         #   dynstate.last_request_generation = cfg_request_gen
+        #   dynstate.last_pack_snapshot = target_pack
         #   dynstate.current = NewRequestState(..., materialized_by_request_generation=cfg_request_gen, ...)
         #   prior dynstate.current → moved to history with obsolete=True
         # All in one update_dynstate snapshot per §3.7 invariant.
         return
 
     # ── Trigger B: pack-data changed since last snapshot ──
+    # Reaches here when cfg_request_gen <= last_request_generation (no
+    # explicit-generation trigger). A pack change is still a valid trigger.
     if target_pack != self.dynstate.last_pack_snapshot:
         self._materialize_new_request(target_pack, materialized_by_gen=self.dynstate.last_request_generation,
                                       cfg_local=local_cfg, global_cfg=global_cfg,
@@ -548,22 +566,24 @@ def devname_from_swi_path(path: ttt.Path) -> str:
 
 ### 7.2 Global config subscription + runner-status guard (🆕 D8; v5.1 fixes)
 
+See §7.3 below for the full `act` callback shape (closure-shared with `function_factory` to access the same `SwInstallTransform` instance for installing `stash_cb`). The §7.3 form is the canonical construction site; this section focuses on the global-config subscription + watchdog wiring that lives inside it.
+
+The relevant parts of `act` for §7.2 are:
+
 ```acton
 proc def act(params: ttt.TransformActorParams) -> ?proc(gdata.Node, ?gdata.Node) -> None:
+    fn = fn_holder[0]                     # SwInstallTransform from §7.3 closure
     devname = devname_from_swi_path(params.path)
-    runner = DeviceRunner(
-        params.path, params.update_oper, params.update_dynstate,
-        dev_registry.get(devname),
-        transform_fn,             # 🆕 v5.1: for stash_cb installation (§3.6)
-        ...
-    )
-    transform_fn.stash_cb = runner._stash_dynstate    # 🆕 v5.1: action-ref push
+    runner = DeviceRunner(...)            # see §8.2 for the full constructor signature
+    fn.stash_cb = runner._stash_dynstate  # 🆕 v5.2 per A1: same-actor write
     if params.lower is not None:
         params.lower.declare_subscriptions(
             owner_id="sw_install:" + devname,
             cb=runner.on_global_config,
-            want={SubscriptionSpec(filt=SOFTWARE_INSTALL_FILTER, period=5.0)},  # 🆕 v5.1: pinned period
+            want={SubscriptionSpec(filt=SOFTWARE_INSTALL_FILTER, period=5.0)},  # period pinned to 5s
         )
+    # The runner schedules its own missing-global-config watchdog at
+    # construction time per §7.2 algorithm below.
     return lambda cfg, mem: runner.on_local_config(cfg, mem)
 ```
 
@@ -581,8 +601,14 @@ MISSING_GLOBAL_CONFIG_GRACE = 15.0    # seconds; >= subscription period (5s) + l
 after MISSING_GLOBAL_CONFIG_GRACE: self._check_global_config_seen()
 
 action def on_global_config(merged: ?gdata.Node, err: ?Exception):
-    # Layer.declare_subscriptions only fires the cb when merge_subscription_tree
-    # returns non-None — never with a None merged tree (per ttt.act _owner_publish).
+    # Layer.declare_subscriptions's _owner_publish (ttt.act:663-672) fires
+    # the cb when EITHER err is not None OR merged != last_merged. The
+    # latter cannot transition out of None == None, which is why a wrong
+    # topology (where /software-install/ is absent from the lower layer
+    # forever) yields no cb invocation at all — the watchdog below is the
+    # only mechanism that catches that case. Errors do fire the cb; we
+    # ignore err here because the watchdog is a sufficient backstop and
+    # transient subscription errors during startup are noise.
     if merged is not None and contains_software_install_subtree(merged):
         self.global_config_cache = parse_global_config(merged)
         self.global_config_seen = True
@@ -692,7 +718,16 @@ def make_sw_install_transform(
                 params.update_oper,                    # proc(?gdata.Node) -> None
                 params.update_dynstate,                # proc(?gdata.Node) -> None
                 dev_registry.get(devname),
-                ...
+                # Remaining args (local_fi, remote_fi_factory, file_transfer,
+                # ops_factory, cli_session_factory, log_handler) are closed
+                # over from make_sw_install_transform's outer scope and
+                # passed positionally per §8.2's DeviceRunner signature.
+                local_file_inspector or default_local_fi(file_cap),
+                remote_file_inspector_factory or default_remote_fi_factory,
+                file_transfer_factory and file_transfer_factory(...) or NoopFileTransfer(),
+                ops_factory_for(devname),              # selected by device OS, see §9.7
+                cli_session_factory,
+                log_handler,
             )
             # 🆕 v5.2 per A1: single-owner stash_cb install. The act callback
             # runs in the same actor that owns `fn` (the Transaction actor),
@@ -766,10 +801,10 @@ actor DeviceRunner(
 
 ### 8.4 Restart story (🆕 v5.1 corrected lifecycle ordering per round-5 A3)
 
-On platform startup, the actual ordering (verified against `app.act:138-152`):
+On platform startup, the actual ordering (verified against `app.act:138-152` and the per-list-entry construction path at `ttt.act:1232-1331`):
 
-1. **Layer rootgen** — `Layer(...)` calls `rootgen(...)`, which constructs `SwInstallTransform`. The `act` callback fires during `init_dynstate`; runner is constructed **here** with empty in-memory dynstate. Runner installs `stash_cb` on `SwInstallTransform`. The actor is alive and running with empty state.
-2. **`Layer.load_from_db()`** — restores `_TransformTransaction.dynstate` from LMDB. The transform-transaction's dynstate field now holds the restored value, but the runner doesn't know yet.
+1. **Layer rootgen** — `Layer(...)` calls `rootgen(...)`. For sw-install (which lives inside a `ttt.List`), this constructs the `_List` / `ListState` but does NOT yet materialize any list entries — `SwInstallTransform` and `DeviceRunner` do not exist for any specific device until step 2.
+2. **`Layer.load_from_db()`** — replays LMDB records. ATTR_KEYS records arrive first (lexicographic ordering); for each restored device key, the platform calls `template(PathKey(...), lower)` which constructs `SwInstallTransform` + `DeviceRunner` for that device. During `act`, the factory installs `fn.stash_cb = runner._stash_dynstate`. ATTR_DYNSTATE records then replay, populating `_TransformTransaction.dynstate`. (Fresh installs with no LMDB records skip directly to step 4 when the user authors the device's `software-pack` subtree via `edit_config`.)
 3. **`app.StartupBootstrap.recompute(force=True)`** — forces a recompute that calls `transform_wrapper(cfg, linked, memory, dynstate)`. The `dynstate` arg is the restored value. `transform_wrapper` invokes `self.stash_cb(dynstate)` — the action lands on the runner's mailbox.
 4. **`_TransformTransaction.finalize`** — calls `function.on_conf(self.get(), self.memory)` if `self.running` is non-empty. This is the runner's `on_local_config`.
 5. **Runner reconciliation** — by now both `_stash_dynstate(dynstate)` and `on_local_config(cfg, mem)` have fired; the runner has restored its dynstate, run §3.5 consistency check, and applied recovery rules (processing → failed-transient; cancelling → cancelled; etc.).
@@ -914,10 +949,10 @@ action def _poll_device_readiness():
 
 ---
 
-## 16. Round-7 review
+## 16. Round-8 review
 
-v5.2 integrates round-6 feedback: action-ref stash single-owner installation, concrete missing-global-config algorithm, §4.1 reconciliation pseudocode with `materialized_by_request_generation` semantics, FIFO-mailbox-with-empty-restore-signal pattern, required topology-misconfigured integration test, plus stale-text and citation cleanups.
+v5.3 integrates round-7 feedback: §4.1 idempotency check rescoped to require pack equality (codex r7 H1 algorithm bug fix), §7.2 stale `transform_fn` snippet replaced with reference to §7.3 single source (claude r7 H1), §3.6/§8.4 lifecycle prose corrected for per-list-entry construction (claude r7 MED 1), §3.6.1 substitution note for _signal_no_restore, §7.3 elided factory args spelled out, §7.2 _owner_publish prose tightened, §2 5-second→15-second reference fix, stale _signal_no_restore comments removed.
 
-Both round-6 reviewers' verdict was "green-light Phase 4 after these fixes." v5.2 lands them.
+Both round-7 reviewers' verdict was "green-light Phase 4 after these fixes." v5.3 lands them.
 
-**Stop here for round-7 lock-in review.** Both reviewers will be re-briefed against the full revised doc set with no carry-over context. Convergence trajectory (HIGH count 6 → 5 → 3+3 → 2+2) suggests round 7 finds 0-1 items.
+**Stop here for round-8 lock-in review.** Round-7 found 1+1 HIGHs (different items, both real). Round-8 expectation: zero findings or 1 cosmetic item — if so, lock in and start Phase 4. Otherwise iterate v5.4.
