@@ -1,6 +1,6 @@
-# 02 — Stratoweave `software-install` Module Design (v5.3.1 — LOCKED IN)
+# 02 — Stratoweave `software-install` Module Design (v5.3.2 — self-contained)
 
-> **Status: v5.3.1 — LOCKED IN for Phase 4 implementation. Round-8 (`docs/reviews/21-codex-design-r8.md` + `docs/reviews/22-claude-design-r8.md`) produced ZERO HIGH findings and convergent 1 MED + 2 LOWs across both reviewers — landed in v5.3.1 as a polish pass (§3.7 prose alignment, §7.3 file_transfer_factory(dev, dmc) spelling, version labels). Both r8 reviewers explicitly: "Green-light Phase 4." Convergence trajectory: HIGH count 6 → 5 → 3+3 → 2+2 → 1+1 → 0+0 across 8 review rounds.**
+> **Status: v5.3.2 — locked in after 8 review rounds (HIGH count 6 → 5 → 3+3 → 2+2 → 1+1 → 0+0). v5.3.2 is a content-only readability pass: the 14 sections that earlier revisions had shortened to "(unchanged)" placeholders are now inlined with full prose so the doc stands alone for a fresh reader without git-diving. No semantic changes vs v5.3.1; the architecture, algorithms, and decisions are identical.**
 
 > **No platform-side prerequisites required for Phase 4 implementation** (down from v4's "platform addition required"). v5 promoted the `transform_wrapper`-stash dynstate-restore path to primary because actor construction runs before `Layer.load_from_db()` in the live lifecycle — so the originally-proposed `TransformActorParams.dynstate` field would be `None` at construction even if added. The stash path leverages the existing post-restore recompute and works without platform changes. See §3.6.
 
@@ -148,7 +148,7 @@ def get_layers(dev_registry, log_handler, db, file_cap):
 
 ## 3. Where state lives
 
-### 3.1 The ownership rule (unchanged)
+### 3.1 The ownership rule
 
 | Surface | Contents | Mutability |
 |---------|----------|------------|
@@ -157,7 +157,7 @@ def get_layers(dev_registry, log_handler, db, file_cap):
 | Oper (gdata published via `update_oper`) | pure projection of dynstate plus computed view | external read |
 | Transform `memory` | unused | n/a |
 
-### 3.2 Per-device dynstate schema (unchanged from v4)
+### 3.2 Per-device dynstate schema
 
 ```acton
 class SwInstallDynstate(value):
@@ -198,7 +198,7 @@ OS-specific diagnostic leaves under `request/component/` use YANG `when` constra
 - IOS-XR-only **deferred to Phase 6 YANG additions**: `packages`, `reload-required`.
 - Junos per-RE diagnostics: **deferred to Phase 6 YANG additions** (will need a per-RE list under `component/`).
 
-### 3.4 Request history retention (unchanged)
+### 3.4 Request history retention
 
 Top-level `dynstate.last_pack_snapshot` is the authoritative idempotency baseline. `history` retains: latest of each terminal status + up to 50 entries total.
 
@@ -339,9 +339,9 @@ This means `_stash_dynstate` is **always called** before any `on_local_config`, 
 - `current.run_log` entries.
 - Intra-step polling counters (reset on retry).
 
-### 3.8 `internal-state` deviation (unchanged)
+### 3.8 `internal-state` deviation
 
-Dropped from YANG; replaced by typed diagnostic projections (§3.3).
+The Python `software-install` package serializes the per-component `State` object as `jsonpickle` JSON in the `request/component/internal-state` YANG leaf. This is dropped from the v5+ YANG; the operationally-useful fields are now surfaced as typed leaves under `request/component/` (see §3.3 diagnostic projections — `destination-volume`, `destination-paths`, `boot-time`, `rebooted`, IOS-XR `op-id-*`, etc.). Trade-off: better for typed inspection (RESTCONF clients see schema-defined leaves), worse for "show me everything via one CLI command" (the opaque blob is gone). Captured as conscious deviation §15.5 #1.
 
 ---
 
@@ -439,8 +439,6 @@ action def _reconcile_create_request(local_cfg: gdata.Node, global_cfg: GlobalSw
 
 This is the round-6 codex H1 / claude r5 H1 idempotency story made concrete.
 
-### 4.1.1 `create-request` (unchanged from v3 in terms of end-user effect)
-
 ### 4.2 `execute-request` ↔ `start-generation` — auto-execute idempotency anchor (🆕 CR4_5)
 
 `unprocessed → processing` requires either:
@@ -459,9 +457,15 @@ This is the round-6 codex H1 / claude r5 H1 idempotency story made concrete.
 
 🆕 v5 fixes the `_drain_notify` token comparison: `stale_token < current.generation_token` (was `stale_token + 1 == current.generation_token` in v4). The wider comparison handles drain-from-multi-generations-ago — relevant after cancel-then-restart-then-execute. Watchdog (`CANCEL_DRAIN_TIMEOUT` 600s) remains the backstop.
 
-### 4.5 `clear-run-log` (unchanged)
+### 4.5 `clear-run-log` ↔ `clear-run-log-generation`
 
-### 4.6 Per-request scoping + `last-trigger-result` (unchanged from v4)
+**Trigger:** `clear-run-log-generation > dynstate.last_clear_run_log_generation`.
+
+**Behavior:** drop all `run-log[]` entries for the targeted request (per §4.6 scoping), reset `run_log_dropped` to 0, reset the per-request `seq` counter to 0. Run-log `(when, seq)` keying guarantees no collision against pre-clear entries because the ring is empty post-clear.
+
+Complements (does not replace) the bounded ring buffer (§6.6).
+
+### 4.6 Per-request scoping + `last-trigger-result`
 
 🆕 **Single-slot `last-trigger-result` is documented as not suitable for high-throughput automation polling** (per CL4_5). Per-call audit lives in the run-log: the runner emits a swi_*-tagged log entry on every trigger consumption. v2.0 enhancement: widen to a small ring of last 5 results.
 
@@ -481,29 +485,206 @@ This is the round-6 codex H1 / claude r5 H1 idempotency story made concrete.
 
 ---
 
-## 5. Typed data model (unchanged)
+## 5. Typed data model
+
+Two layers:
+
+1. **`gen_adata`-generated typed accessors** for the YANG (`model.act` after build) — driven by the `software_install` YANG module the design ships in `yang.act`.
+2. **Internal value types** in `pack.act` / `state.act` tuned for state-machine use (hashable as map keys, deep equality, immutability under value-typed semantics).
+
+### 5.1 Pack types (`pack.act`)
+
+```acton
+class SoftwarePackOs(value):
+    IOSXR = "ios-xr"
+    JUNOS = "junos"
+    SROS = "sros"
+    VRP = "vrp"           # kept; ValidatePlatform fails clean
+
+class ComponentKind(value):
+    BASE = 0
+    PATCH = 1
+
+class SoftwarePackComponent(value):
+    kind: ComponentKind
+    version: str
+    filenames: list[str]
+    os: SoftwarePackOs
+    def name(self) -> str: ...           # "base-<version>" or "patch-<version>"
+
+class SoftwarePack(value):
+    name: str
+    os: SoftwarePackOs
+    base: ?SoftwarePackComponent
+    patches: list[SoftwarePackComponent]
+    def components(self) -> list[SoftwarePackComponent]: ...
+```
+
+### 5.2 State types (`state.act`)
+
+Per-OS State subclasses each implement `reset()` per logic-spec §5.1 (the "device drifted, restart from scratch" lever, called from `CheckVersions` when the previously-Done version is no longer running on the device):
+
+```acton
+class State(value):
+    device: str
+    component: SoftwarePackComponent
+    virtual_router: bool
+    done: bool
+    def reset(self) -> State: ...
+
+class GenericDevice(value):
+    destination_volume: ?str
+    destination_paths: dict[str, str]
+    boot_time: ?datetime
+    done: bool
+    def reset(self) -> GenericDevice: ...
+
+class StateSros(value):
+    base: GenericDevice
+    head: State
+    version: ?str
+    rebooted: bool
+    def reset(self) -> StateSros: ...
+
+class StateIosXr(value):
+    base: GenericDevice
+    head: State
+    op_id_add: ?int
+    op_id_prepare: ?int
+    op_id_activate: ?int
+    op_id_commit: ?int
+    packages: list[str]
+    reload_required: bool
+    def reset(self) -> StateIosXr: ...
+    # restart_prepare_clean / restart_prepare / restart_activate per logic-spec §5.3
+
+class RouteEngine(value):
+    base: GenericDevice
+    version: ?str
+    rebooted: bool
+
+class StateJunos(value):
+    head: State
+    dual_re: ?bool                       # cross-run invariant — see §6.3
+    switch: bool
+    failover_config: ?value
+    route_engine: dict[str, RouteEngine]
+    route_engine_priority: list[int]
+    def reset(self) -> StateJunos: ...
+```
+
+`reset()` returns a new value (Acton value-typed semantics) rather than mutating; callers replace the State binding with the returned one. Per-component State is stored in `RequestState.states[<component_name>]` (dynstate; see §3.2).
 
 ---
 
 ## 6. Plan + step semantics
 
-(Mostly carried.)
+### 6.1 `Step` protocol
 
-### 6.1 `Step` protocol (carried; type formalization unchanged)
+```acton
+class StepResult(value):
+    SUCCESS = 0
+    FAILURE = 1
+    SKIP_STEP = 2
+    SKIP_COMPONENT = 3
+    WAIT = 4
 
-### 6.2 Step contract invariants (unchanged)
+class StepKey(value):
+    name: str
+    re_id: ?str        # None for non-Junos and for the trailing Done
 
-### 6.3 ComponentPlan invariants (unchanged)
+# Step callback signature:
+#   cb(result: StepResult, new_state: ?State, exc: ?Exception)
+#
+# `new_state = None` means "no state change for this step" (rare; most
+# steps return an updated state even on SKIP_STEP because they may have
+# observed something worth recording). `exc` is non-None iff the step
+# body raised; the runner logs the traceback and treats as FAILURE
+# regardless of the StepResult value.
 
-### 6.4 Per-OS step lists (unchanged)
+class Step(object):
+    key: StepKey
+    proc def pre_check(self, state, ops: DeviceOps,
+                       lfi: LocalFileInspector, rfi: RemoteFileInspector, ft: FileTransfer,
+                       step_log: StepLogger,                                       # per-step logger (§6.6)
+                       cb: action(StepResult, ?State, ?Exception) -> None) -> None: ...
+    proc def execute(self, state, ops: DeviceOps,
+                     lfi, rfi, ft, step_log,
+                     cb: action(StepResult, ?State, ?Exception) -> None) -> None: ...
+    def next_step(self, state) -> ?StepKey: ...
+    def supports_pre_check(self) -> bool: ...
+```
 
-### 6.5 Status mapping at run end (unchanged)
+Step methods receive **six** parameters: `state`, `ops`, `lfi`, `rfi`, `ft`, `step_log`. Plus the `cb` callback.
+
+- `state` — per-component value-typed State (per §5.2 / `state.act`); the step returns a possibly-updated State via `cb`.
+- `ops: DeviceOps` — per-OS facade for NETCONF/CLI device operations (§9.7).
+- `lfi: LocalFileInspector` — controller-side filesystem checks (§9.2).
+- `rfi: RemoteFileInspector` — device-side file metadata via NETCONF (§9.3).
+- `ft: FileTransfer` — byte-mover (Phase 5; `NoopFileTransfer` in Phase 4).
+- `step_log: StepLogger` — pre-bound to the step's `swi_request_path/swi_component/swi_step/swi_run_id` so step authors don't need to remember the keys (§6.6).
+
+State is value-typed and threaded through the callback. The runner persists the new state only when `result != FAILURE` (§6.3 flush ordering).
+
+### 6.2 Step contract invariants
+
+- **Steps are ordinary classes**, not actors. The runner constructs `cb` as an `action def` defined on itself; closing over `self` makes the callback dispatch on the runner mailbox automatically. Steps that need helper actors must terminate them before invoking `cb`.
+- **Callback mailbox.** The `cb` passed to a step always dispatches on the per-device DeviceRunner mailbox. This is what makes the §8 generation-token check effective — stale callbacks land on the runner, not the step's own actor.
+- **`next_step` jump-target validation.** If `next_step(state)` returns a `StepKey` not present in the current plan, the runner emits a clear log entry and returns `FAILURE` for the current step. (Mirrors Python `refresh_steps`'s regression guard.)
+- **Failure isolation.** A step's exception surfaces as `(FAILURE, ?State, exc)` from the callback. The runner logs the traceback and proceeds with FAILURE handling — exceptions never propagate up the actor.
+- **`exc` convention.** `exc` is non-None iff the step body raised. Runner logs traceback and treats as FAILURE regardless of the StepResult value.
+
+### 6.3 `ComponentPlan` invariants
+
+- **Refresh discipline (A8 from round-2):** `refresh_steps` runs **after every step's `_execute_step_action`**, not only at run start. This is what enables IOS-XR FPDs to be discovered mid-run (the FPD list only becomes known after `SoftwarePrepare`).
+- **Monotonicity (A8):** the refresh may add steps but must not remove prior components or steps. A removal indicates a logic bug; the runner raises.
+- **Flush ordering (CL8 from round-2):**
+  1. Step's `pre_check` or `execute` returns `(StepResult, NewState)`.
+  2. If `result != FAILURE`: persist NewState into the per-component State store (Tier B dynstate write — §3.7).
+  3. If `result == FAILURE`: discard NewState; mark step `failed`; mark all subsequent steps in the component back to `not-reached` (or `waiting-confirmation` if confirm-mode).
+  4. Refresh the plan.
+  5. Persist the plan (Tier B dynstate write).
+
+A FAILURE result must NOT persist the half-mutated NewState — this is a load-bearing invariant for crash safety.
+
+### 6.4 Per-OS step lists
+
+- **SROS** (`platform_sros.act`, Phase 4): step list per logic-spec §6.1. `ValidatePlatform → CheckFiles → CheckVersions → ActivatePrimary → GetBootTime → CopyImage → PrepareCopyBootLdr → PrepareConfigureBof → PrepareHackFormatStandby → PrepareSaveRollback → PrepareSynchronizeBootenv → Reboot → Done`. **No `Cleanup` step** — that's IOS-XR-only (logic-spec §6.2).
+- **IOS-XR** (`platform_iosxr.act`, Phase 6): step list per logic-spec §6.2. **`Cleanup` is IOS-XR-only.** `CheckVersions` requires controller-side archive parsing (`.iso` via `get_version_from_iso`, `.tar` via `get_file_packages`) — Phase 6 dependency on iso/tar parsers in Acton.
+- **Junos** (`platform_junos.act`, Phase 6): per logic-spec §6.3. **`StepKey(name, re_id=None)` for the trailing unparameterized `Done`** (CL12). **Cross-run invariant (CL10):** if `state.dual_re` changes between runs of the same request, `ValidatePlatform` returns FAILURE and invalidates the request.
+- **VRP**: enum kept; `ValidatePlatform` fails cleanly with "unsupported platform". No step module wired.
+
+### 6.5 Status mapping at run end
+
+```
+if request.obsolete:                             status = OBSOLETE
+elif all components.completed:                   status = DONE; clear error_count
+elif needs_confirmation:                         status = WAITING_CONFIRMATION
+elif last_result == WAIT:                        status = FAILED_TRANSIENT
+                                                 error_count.transient += 1
+                                                 error_count.other = 0
+elif last_result == FAILURE (or other non-success):
+                                                 status = FAILED_OTHER
+                                                 error_count.other += 1
+                                                 error_count.transient = 0
+```
+
+Counters are **consecutive**; FAILURE resets `transient`, WAIT resets `other`. DONE clears `error_count` entirely (including `error_count.backoff`).
 
 ### 6.6 Run-log filter, plumbing, bounded ring (🆕 CL4_10 redaction hook)
 
 🆕 v5 adds to the `RunLogHandler` contract: "`RunLogHandler` skips records with `swi_redacted=True` in their structured-data dict — Phase 5 transcript redaction will use this." The handler check is one line; Phase 5 templates carrying secrets in `Send "${Pass}"` mark their transcript records with `swi_redacted=True` and don't pollute the persistent run-log.
 
-### 6.7 Retry budget (unchanged)
+### 6.7 Retry budget
+
+Per-class budget (matches the Python spec exactly):
+
+- After a WAIT terminal: if `error_count.transient > config.max_retries` → terminate as `FAILED_TRANSIENT`.
+- After a FAILURE terminal: if `error_count.other > config.max_retries` → terminate as `FAILED_OTHER`.
+
+**Backoff formula** (CR2 from round-4): `backoff = (error_count.backoff or 10) * factor` (factor mode) — exactly the Python spec, not `factor * max(...)`.
+
+**Backoff rounding** (CR3_4 from round-3): internally compute as decimal; round to `ceil(seconds)` when persisting to `error_count.backoff` (uint32) and projecting `next_wake_at`. The fractional sequence `(10.0, 12.0, 14.4, 17.28, ...)` becomes `(10, 12, 15, 18, ...)` after ceiling.
 
 ---
 
@@ -763,7 +944,25 @@ def make_sw_install_transform(
 
 ## 8. DeviceRunner architecture
 
-### 8.1 Lease scope (unchanged from v4)
+### 8.1 Lease scope — honest downgrade
+
+The Python `MaapiLocker.lock_partial(/devices/device[name=X])` was a **system-wide** mutex over the device subtree: every other writer blocked while the install was in flight. The Acton `DeviceRunner` does **not** provide an equivalent guarantee. While a sw-install run is active:
+
+- An RFS transform may push config via `DeviceMgr.configure(...)`.
+- A monitoring transform may issue `rpc_xml` against the same adapter.
+- Subscriptions continue to deliver oper updates.
+
+**This is a real safety gap for OS upgrades.** The Acton `DeviceMgr` does not currently expose an exclusive-operation API; adding `DeviceMgr.acquire_exclusive(owner_id, timeout)` is a platform-side change outside sw-install's scope.
+
+**v1 contract:** sw-install serializes its **own** runs per device. Operators must ensure no RFS layer is actively reconciling against a device under upgrade — typically by gating upstream config or by understanding that the install will likely race with normal reconciliation.
+
+This is documented prominently in:
+
+- The README ("Important safety note").
+- §15.5 conscious deviations.
+- The runtime log at request start ("warning: sw-install does not preempt other DeviceMgr writers").
+
+**Platform prerequisite for v2.0:** see §14 item 1.
 
 ### 8.2 The DeviceRunner actor — type fixes (🆕 CL4_1, CL4_6)
 
@@ -825,9 +1024,65 @@ On platform startup, the actual ordering (verified against `app.act:138-152` and
 
 🆕 §15.5 entry: "Oper data is not platform-persisted across stratoweave restart, unlike Python NSO CDB oper. Clients polling during the runner's first reconciliation gap see empty data and must retry."
 
-### 8.5 Cancel implementation (carried v4; CL4_6 fix in §8.2)
+### 8.5 Cancel implementation
 
-### 8.6 Backoff (carried v4; CL3_4 enabled gate carried)
+Per §4.4's state machine: cancel-generation increments transition `processing → cancelling`, and a drain notification (or watchdog timeout) transitions `cancelling → cancelled`.
+
+```
+on cancel-generation increment for current request:
+    if cfg.cancel-target-id is set and not in current+history:
+        publish last-trigger-result {kind: cancel, result: rejected,
+                                     reason: "no such request id <N>"}
+        return                                    # CR3_5: fail-loud
+    persist dynstate.last_cancel_generation := new_value (Tier A)
+
+    if dynstate.current.status == processing:
+        dynstate.current.status = CANCELLING
+        dynstate.current.generation_token += 1     # invalidates in-flight callbacks
+        log "cancellation requested at <step>"
+        self._persist_dynstate(Tier.B); self._publish_oper()
+        # Schedule watchdog: if the in-flight RPC never returns, force drain.
+        after CANCEL_DRAIN_TIMEOUT: self._force_drain(dynstate.current.generation_token)
+    elif dynstate.current.status in (waiting-confirmation, paused, failed-transient, unprocessed):
+        dynstate.current.status = CANCELLED        # nothing in flight, instant
+        self._persist_dynstate(Tier.B); self._publish_oper()
+```
+
+`CANCEL_DRAIN_TIMEOUT` defaults to 600s (matches IOS-XR's `_monitor_operation_log` 600s timeout — never less than the longest in-flight RPC). `_force_drain` checks the token (in case a normal drain happened first), transitions to `cancelled` if still `cancelling`.
+
+The drain itself happens via `_drain_notify` (§8.2): when an in-flight callback returns with a stale token, the guard routes to `_drain_notify` which checks if `dynstate.current.status == CANCELLING` and `stale_token < dynstate.current.generation_token` (the v5.1 CL4_6 fix — was `stale_token + 1 == ...`, which broke after multi-generation drains). If so, transitions to `cancelled` and persists Tier B.
+
+### 8.6 Backoff
+
+Per-device, per-request, runs at the end of every failed run:
+
+```
+on FAILURE / WAIT terminal of a run:
+    error_count.<class> += 1
+    error_count.<other-class> = 0
+    if error_count.<class> > config.max_retries:
+        # Per-class budget exhausted — terminal status matches the failure class
+        publish FAILED_<class>; gave_up = True; done
+    backoff_decimal = (error_count.backoff_decimal or 10.0) * factor    # CR2: exact spec
+    error_count.backoff = ceil(backoff_decimal)                          # uint32 in oper
+    error_count.backoff_decimal = backoff_decimal                        # internal precise state
+    next_wake_at = now() + ceil(backoff_decimal)
+    self._persist_dynstate(Tier.A)                                       # before scheduling
+    after error_count.backoff: self._start_run()
+
+
+action def _start_run():
+    # CL3_4 (round-3): re-check enabled at firing time
+    if not global_config_cache.enabled:
+        dynstate.current.status = PAUSED
+        self._persist_dynstate(Tier.B); self._publish_oper()
+        return
+    # ... normal start
+```
+
+`error_count.backoff` and `next_wake_at` are projected into oper (CR3 from round-3) so operators see the retry schedule.
+
+On restart with `next_wake_at` in the future, schedule a fresh `after max(0, next_wake_at - now): _start_run()`.
 
 ### 8.7 Device-not-yet-ready case — fixed get_modules shape (🆕 CR4_2)
 
@@ -857,11 +1112,77 @@ action def _poll_device_readiness():
 
 ## 9. Transport scope
 
-### 9.1 (unchanged)
+The Python `software_install_script.py` mixes NETCONF, CLI, and SCP per-OS. v3+ splits these into clean abstractions and ships only what Phase 4 needs.
 
-### 9.2-9.4 LocalFileInspector / RemoteFileInspector / FileTransfer (unchanged)
+### 9.1 Op coverage matrix
 
-### 9.5 Credential reuse — `DeviceMgr.get_dmc()` (unchanged from v4)
+| Op | SROS | IOS-XR | Junos |
+|----|------|--------|-------|
+| version, redundancy, boot time, free space | NETCONF state datastore | NETCONF live-status oper | NETCONF RPCs |
+| install/activate/commit | NETCONF actions | NETCONF actions | `request package add` via NETCONF |
+| BOF reconfiguration | NETCONF edit-config (`bof-running`) | n/a | n/a |
+| Device file inspection (stat/list) | `RemoteFileInspector` over NETCONF (Phase 4) | Phase 6 | Phase 6 |
+| Image upload (byte transfer) | `FileTransfer` (Phase 5) | Phase 5 | Phase 5 (also cross-RE `file copy`) |
+| `prepare_format_standby` (SROS) | NotImplementedError → SKIP_STEP | n/a | n/a |
+| `prepare_save_rollback` (SROS) | NotImplementedError → SKIP_STEP | n/a | n/a |
+| Archive parsing (IOS-XR `.iso`/`.tar`) | n/a | Phase 6 — controller-side iso/tar libs | n/a |
+| Interactive CLI (prompts, log scraping) | Phase 5 (TextFSMPlus templates — see ADR) | Phase 5 | Phase 5 |
+
+### 9.2 `LocalFileInspector` — controller-side filesystem
+
+```acton
+class LocalFileInspector(object):
+    proc def is_file(self, path: str, cb: action(bool, ?Exception) -> None) -> None: ...
+    proc def get_size(self, path: str, cb: action(?u64, ?Exception) -> None) -> None: ...
+    proc def hash(self, path: str, algo: str, cb: action(?str, ?Exception) -> None) -> None: ...
+```
+
+Used by `CheckFiles` (every per-OS step list starts with this — verify the controller has the file before doing anything else). Default Phase 4 impl uses Acton stdlib filesystem primitives accessed via the `file.FileCap` injected through `make_sw_install_transform`.
+
+**Phase 4 deviation** (CR3_2 from round-3): when `file_transfer.caps().put == false` (Phase 4's `NoopFileTransfer`), `CheckFiles.execute` skips the controller-side filesystem check entirely. The pre-staged-image scenario relies on `RemoteFileInspector` (§9.3) for verification instead. Documented as a conscious deviation in §15.5.
+
+### 9.3 `RemoteFileInspector` — device-side metadata via NETCONF
+
+```acton
+class RemoteFileInfo(value):
+    path: str
+    size: ?u64
+    checksum: ?str
+    checksum_algorithm: ?str
+    mtime: ?str
+
+class RemoteFileInspector(object):
+    proc def stat(self, path: str, cb: action(?RemoteFileInfo, ?Exception) -> None) -> None: ...
+    proc def list(self, dir: str, cb: action(list[RemoteFileInfo], ?Exception) -> None) -> None: ...
+```
+
+Per-OS implementations:
+
+- **SROS** (`ops_sros.act`, Phase 4): `oper-file` get + `state state` queries via NETCONF — the same paths the Python `NokiaSrosNetconfStrategy.copy_file` and `is_bof_configured` use.
+- **IOS-XR / Junos** (Phase 6): per-OS NETCONF state queries.
+
+Used by `CopyImage.pre_check`: stat each filename → compare size/checksum → `SKIP_STEP` if all present and match (no upload needed); `FAILURE` if missing and no FileTransfer available; else `SUCCESS` (proceed to execute / byte transfer). The separation from `FileTransfer` is what lets Phase 4 (with `NoopFileTransfer`) still verify pre-staged images cleanly.
+
+### 9.4 `FileTransfer` — Phase 5 byte-mover
+
+```acton
+class FileTransferCaps(value):
+    put: bool
+    delete: bool
+    device_pull: bool       # device fetches from URL (preferred where supported)
+
+class FileTransfer(object):
+    proc def caps(self) -> FileTransferCaps: ...
+    proc def put(self, local_path: str, remote_path: str,
+                 cb: action(?Exception) -> None) -> None: ...
+    proc def delete(self, path: str, cb: action(?Exception) -> None) -> None: ...
+```
+
+Phase 4 ships **`NoopFileTransfer`** with `caps()` returning all-false and `put`/`delete` returning `NotImplementedError`. Because `RemoteFileInspector` is a separate abstraction (§9.3), Phase 4 SROS can still verify pre-staged images via NETCONF and SKIP_STEP `CopyImage` cleanly.
+
+`CopyImage.execute` in Phase 4: returns FAILURE with a clear "no FileTransfer configured — pre-stage the image" message if files are missing per `RemoteFileInspector`. Phase 5 fills in real `FileTransfer` impls (SCP/SFTP via `ssh_client` or device-pull).
+
+### 9.5 Credential reuse — `DeviceMgr.get_dmc()`
 
 ### 9.6 `scp-port` placement — back to nested (🆕 D7)
 
@@ -869,7 +1190,26 @@ action def _poll_device_readiness():
 
 §15.5 #14 corrected: "scp-port lives inside software-pack/. Removing the software-pack also removes scp-port — but the operator removing the pack is disabling sw-install for the device anyway, so the loss is acceptable."
 
-### 9.7 DeviceOps facade (unchanged)
+### 9.7 `DeviceOps` facade — CLI strategy boundary
+
+The Python original mixes NETCONF and CLI per-OS — `NokiaSrosCliStrategy` vs `NokiaSrosNetconfStrategy` both implement `NokiaSrosOperationsProto`, with `NokiaSrosOperations` delegating based on device capabilities. v3+ preserves this strategy pattern.
+
+```acton
+# ops.act
+class DeviceOps(object):
+    """Per-OS operations facade. Hides NETCONF/CLI strategy choice from steps."""
+    proc def get_version(self, cb: action(?str, ?Exception) -> None) -> None: ...
+    proc def get_boot_time(self, cb: action(?datetime, ?Exception) -> None) -> None: ...
+    proc def get_redundancy_info(self, cb: action(?(str, str), ?Exception) -> None) -> None: ...
+    proc def reboot(self, cb: action(?bool, ?Exception) -> None) -> None: ...
+    # ... per-OS device interaction primitives
+```
+
+`SrosOps` (and `IosXrOps`, `JunosOps` in Phase 6) implement the facade; internally they select NETCONF or CLI strategy based on `dev.get_capabilities()` / `dev.get_modules()` snapshot. **Capability snapshot is per-run** (not per-step) — fail clean on incompatible drift between runs (CR6 from round-3).
+
+Phase 4: `SrosOps` is constructed with `cli_session = None`. NETCONF strategy methods are real; **no per-method CLI stubs raising `NotImplementedError`** — that would be dead surface that increases test burden without delivering behavior. SROS Phase 4 only invokes NETCONF paths.
+
+**Phase 5** adds CLI strategy methods alongside the existing NETCONF ones inside the per-OS `Ops` actor; the `DeviceOps` facade signature doesn't change. **TextFSMPlus implementation details** (templates, `Send`/`Preset`/`Done` semantics, aycalc-equivalent expression eval, prompt synchronization, terminal width, command echo, secrets handling, the acton-utils textfsm extension dependency) live in `docs/adr/cli-driver.md`. That ADR is a Phase 5 design artifact; this design doc commits only to the `DeviceOps` boundary.
 
 ---
 
@@ -903,7 +1243,14 @@ action def _poll_device_readiness():
 
 ---
 
-## 13. Implementation details deferred (unchanged)
+## 13. Implementation details deferred to first-cut coding
+
+These resolve naturally during Phase 4 implementation; flagged here so they don't become surprises:
+
+- **Exact lmdb key layout for runner dynstate.** Follows `_TransformTransactionBase.db_ops` patterns; the platform handles the layout, sw-install just produces a single `gdata.Node` per transform via `update_dynstate(...)`.
+- **`update_oper` snapshot frequency.** Coalesce per-tick polls; flush on every state-class transition (request status change, step boundary, run-log entry that crosses a tier-class threshold per §3.7).
+- **Acton stdlib logging-handler glue for `swi_*` attribute filtering.** §6.6's `RunLogHandler` needs to be implemented as a concrete `logging.Handler` subclass that inspects `record.data` for the `swi_component` key. Trivial; flagged only because Acton's `logging` module is less feature-rich than Python's.
+- **Acton-stdlib filesystem primitives used by `LocalFileInspector`.** Likely `file.FileCap` + `file.ReadFile` + a stat helper; the public API takes `file_cap` so this is encapsulated behind the inspector boundary.
 
 ---
 
@@ -928,7 +1275,18 @@ action def _poll_device_readiness():
 
 ---
 
-## 15. Deferred features (unchanged)
+## 15. Deferred features
+
+Things deliberately **not** in this design, captured here so future contributors find them rather than rediscovering them:
+
+- **`software-install-matrix`** (Python YANG): unused by Python core logic. Dropped from YANG; not modelled in Acton; re-add only if a real use case surfaces.
+- **CLI / TextFSMPlus parsing**: Phase 5 dependency on the acton-utils textfsm extension (Send/Preset/Done line actions + aycalc-equivalent expression eval). Reference impl `/Users/ayourtch/rust/ayclic/aytextfsmplus`. See `docs/adr/cli-driver.md`.
+- **IOS-XR archive parsing** (`get_version_from_iso` / `get_file_packages`): controller-side iso/tar reading. Phase 6 dependency on iso/tar libraries in Acton.
+- **VRP step module**: enum value preserved, `ValidatePlatform` fails clean. Implementation deferred indefinitely.
+- **Snabb / ONS-TL1 / HGW**: dropped from the Acton port (logic-spec §6.4). Dropped, not deferred — re-adding would require revisiting the device-OS detection logic.
+- **Approval-required / multi-stage commit hooks**: out of scope for sw-install — that's the platform's job (`DeviceMetaConfig.approval_required` already exists).
+- **`DeviceMgr.acquire_exclusive(...)` lease API**: v2.0 platform prerequisite (§14 item 1).
+- **acton-utils textfsm extension**: parallel platform workstream that sw-install Phase 5 consumes. See ADR.
 
 ## 15.5 Conscious deviations from the Python spec
 
