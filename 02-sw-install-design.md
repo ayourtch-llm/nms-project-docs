@@ -1,6 +1,6 @@
-# 02 — Stratoweave `software-install` Module Design (v5.1)
+# 02 — Stratoweave `software-install` Module Design (v5.2)
 
-> **Status: v5.1 — incorporates round-5 review feedback from `docs/reviews/12-codex-design-r5.md` and `docs/reviews/13-claude-design-r5.md`, integrated in `docs/reviews/14-integration-r5.md`. Both r5 reviewers explicitly endorsed v5's architectural direction; v5.1 lands the 13 doc/skeleton-shape fixes both reviewers identified. Pending round-6 review for green-light to Phase 4 implementation.**
+> **Status: v5.2 — incorporates round-6 review feedback from `docs/reviews/15-codex-design-r6.md` and `docs/reviews/16-claude-design-r6.md`, integrated in `docs/reviews/17-integration-r6.md`. Both r6 reviewers explicitly converged on "green-light Phase 4 after v5.2 doc-only pass" with 2 HIGHs and 3 MEDIUMs identified independently. v5.2 lands those 10 items. Pending round-7 lock-in review.**
 
 > **No platform-side prerequisites required for Phase 4 implementation** (down from v4's "platform addition required"). v5 promoted the `transform_wrapper`-stash dynstate-restore path to primary because actor construction runs before `Layer.load_from_db()` in the live lifecycle — so the originally-proposed `TransformActorParams.dynstate` field would be `None` at construction even if added. The stash path leverages the existing post-restore recompute and works without platform changes. See §3.6.
 
@@ -189,13 +189,14 @@ class RequestState(value):
     obsolete: bool
 ```
 
-### 3.3 Diagnostic projections (unchanged shape; CR4_3/CR4_4 deferral noted)
+### 3.3 Diagnostic projections (🆕 v5.2 prose fix per L2)
 
 OS-specific diagnostic leaves under `request/component/` use YANG `when` constraints:
-- Common: `destination-volume`, `destination-paths`, `boot-time`.
+- Common (always present): `destination-volume`, `destination-paths`, `boot-time`.
 - SROS-only: `rebooted`.
-- IOS-XR-only (Phase 6): `op-id-add`, `op-id-prepare`, `op-id-activate`, `op-id-commit`. **Phase 6 also adds `packages` and `reload-required` per §1's SROS+IOS-XR roadmap; v5 YANG models only the common+SROS subset.**
-- Junos per-RE diagnostics (Phase 6): not modeled in v5 YANG; explicit Phase-6 deferral.
+- IOS-XR-only (modeled in v5+ YANG, populated when Phase 6 lands): `op-id-add`, `op-id-prepare`, `op-id-activate`, `op-id-commit`.
+- IOS-XR-only **deferred to Phase 6 YANG additions**: `packages`, `reload-required`.
+- Junos per-RE diagnostics: **deferred to Phase 6 YANG additions** (will need a per-RE list under `component/`).
 
 ### 3.4 Request history retention (unchanged)
 
@@ -234,9 +235,11 @@ This catches **dynstate-blob internal inconsistency** (e.g., a partial dynstate 
 
 **Code shape:**
 
+`SwInstallTransform` (carries the stash callback, no other state):
+
 ```acton
 class SwInstallTransform(ttt.TransformFunction):
-    # 🆕 v5.1: action-ref push, not shared mutable field
+    # 🆕 v5.1 CL5_1: action-ref push, not shared mutable field
     var stash_cb: ?action(?gdata.Node) -> None = None
     var stash_done: bool = False
 
@@ -247,36 +250,48 @@ class SwInstallTransform(ttt.TransformFunction):
         if cb is not None and not self.stash_done:
             cb(dynstate)              # action call — lands on runner mailbox
             self.stash_done = True
-        # 🆕 v5.1 CL5_3: return None for memory (memory is unused for sw-install;
+        # CL5_3: return None for memory (memory is unused for sw-install;
         # returning the input unchanged would surprise readers).
         return (gdata.Container(), None)
+```
 
+🆕 **v5.2 (per A1): the stash_cb is installed by the `act` callback in §7.3, not by the DeviceRunner actor.** The DeviceRunner has no back-reference to `SwInstallTransform`. The function instance only needs a forward-reference (the `stash_cb` action ref) to the runner; the runner does not need to read or write the function.
 
+`DeviceRunner` (the runner — no transform_fn back-reference):
+
+```acton
 actor DeviceRunner(
     ...,
-    transform_fn: SwInstallTransform,    # for installing stash_cb at construction
+    # NO transform_fn parameter — see §7.3 for how stash_cb is installed.
     ...
 ):
     var dynstate: SwInstallDynstate = SwInstallDynstate.empty()
     var dynstate_initialized: bool = False
 
-    # Install the stash callback at runner-construction time, before the
-    # platform's recompute can fire transform_wrapper.
-    transform_fn.stash_cb = self._stash_dynstate
-
     action def _stash_dynstate(stashed: ?gdata.Node):
-        if stashed is not None and not self.dynstate_initialized:
+        # Called by SwInstallTransform.transform_wrapper during the post-restore
+        # recompute. May be called with stashed=None for the empty-restore path
+        # via _signal_no_restore (see §3.6.1 below).
+        if stashed is not None:
             self.dynstate = SwInstallDynstate.from_gdata(stashed)
         self.dynstate_initialized = True
         self._check_restore_consistency()
 
     action def on_local_config(cfg: ?gdata.Node, mem: ?gdata.Node):
-        if not self.dynstate_initialized:
-            # No restored dynstate (fresh install) — proceed with empty state.
-            self.dynstate_initialized = True
-            self._check_restore_consistency()
+        # 🆕 v5.2 (per A4): committed to FIFO mailbox ordering. _stash_dynstate
+        # is enqueued before on_local_config in the post-restore path
+        # (transform_wrapper runs first, then on_conf via finalize). Acton's
+        # actor mailbox is FIFO, so dynstate_initialized is guaranteed True
+        # by the time on_local_config processes — no fallback needed.
+        # The empty-restore path is handled via _signal_no_restore (§3.6.1).
         # ... reconciliation ...
 ```
+
+### 3.6.1 Empty-restore signal (🆕 v5.2 per A4)
+
+When the platform restores no dynstate (fresh install or first boot), `_TransformTransaction.dynstate` is `None`. `transform_wrapper` is still called during the forced recompute (with `dynstate=None`), and the stash mechanism passes `None` into `_stash_dynstate(stashed=None)`. The runner treats this as "fresh install — empty dynstate is correct" and sets `dynstate_initialized = True` without restoring.
+
+This means `_stash_dynstate` is **always called** before any `on_local_config`, regardless of whether dynstate was actually restored. FIFO mailbox ordering then guarantees `dynstate_initialized == True` when `on_local_config` processes — no race, no fallback needed.
 
 **Caveat (per claude r5 §A1):** if `_TransformTransaction.finalize` skips `on_conf` because `self.running` is empty (no `software-pack` has ever been authored for this device), the runner stays in `runner-status = starting` indefinitely. This is the no-software-pack-bound steady-state — benign (there's nothing to do). Operators should treat `starting` plus an empty `request[]` list as "no work configured" rather than "failure to initialize." Documented in §7.2.
 
@@ -323,7 +338,90 @@ Dropped from YANG; replaced by typed diagnostic projections (§3.3).
 
 (Mostly carried from v4; the substantive v5 changes are listed inline.)
 
-### 4.1 `create-request` (unchanged)
+### 4.1 `create-request` reconciliation (🆕 v5.2 per round-6 A3 / MED 1)
+
+Round-6 reviewers caught that v5.1 left this section as "(unchanged)" — but the §3.7 Tier-A invariant references "the §4.1 reconciliation rule" that consumes the new `materialized_by_request_generation` anchor. v5.2 spells out the rule.
+
+**Three independent triggers** for materializing a new request, in precedence order:
+
+```acton
+action def _reconcile_create_request(local_cfg: gdata.Node, global_cfg: GlobalSwInstallConfig):
+    # Inputs:
+    #   local_cfg — /sw-rfs:rfs[name=X]/software-pack/ subtree (config)
+    #   global_cfg — /software-install/ subtree (from subscription)
+    pack_name = local_cfg.get_leaf("name")
+    if pack_name is None:
+        # No pack assignment — nothing to materialize.
+        return
+
+    target_pack = global_cfg.find_software_pack(pack_name)
+    if target_pack is None:
+        # Pack assignment refers to undefined pack — defer until library has it.
+        return
+
+    cfg_request_gen = local_cfg.get_leaf("control/request-generation") or 0
+
+    # ── Idempotency check 1: already materialized for this request-generation? ────
+    if (self.dynstate.current is not None and
+        cfg_request_gen > 0 and
+        self.dynstate.current.materialized_by_request_generation == cfg_request_gen):
+        # Crash-recovery short-circuit: the current request was already
+        # materialized for this exact generation. No-op. Persists across
+        # restart because materialized_by_request_generation is in dynstate.
+        return
+
+    # ── Trigger A: explicit request-generation increment ──
+    if cfg_request_gen > self.dynstate.last_request_generation:
+        self._materialize_new_request(target_pack, materialized_by_gen=cfg_request_gen,
+                                      cfg_local=local_cfg, global_cfg=global_cfg,
+                                      reason="request-generation")
+        # The materialization Tier-A-batches:
+        #   dynstate.last_request_generation = cfg_request_gen
+        #   dynstate.current = NewRequestState(..., materialized_by_request_generation=cfg_request_gen, ...)
+        #   prior dynstate.current → moved to history with obsolete=True
+        # All in one update_dynstate snapshot per §3.7 invariant.
+        return
+
+    # ── Trigger B: pack-data changed since last snapshot ──
+    if target_pack != self.dynstate.last_pack_snapshot:
+        self._materialize_new_request(target_pack, materialized_by_gen=self.dynstate.last_request_generation,
+                                      cfg_local=local_cfg, global_cfg=global_cfg,
+                                      reason="pack-change")
+        # `materialized_by_gen` is set to the current observed generation
+        # value (NOT incremented), preserving idempotency for any future
+        # "same generation, same pack" reconciliation.
+        return
+
+    # ── Trigger C: last request was cancelled, even if pack-data unchanged ──
+    if (self.dynstate.current is not None and
+        self.dynstate.current.status == CANCELLED and
+        cfg_request_gen == self.dynstate.last_request_generation):
+        # Pack-change rule (B) didn't fire because pack hasn't changed.
+        # Cancelled-forces-new requires explicit operator intent: bump
+        # request-generation. Nothing to do here. (Documented in §15.5 #5.)
+        return
+
+    # No trigger fired — current state is consistent with config; idle.
+```
+
+**Precedence:** Trigger A (request-generation) wins over Trigger B (pack-change) when both fire simultaneously — the materialized request records the explicit generation, so subsequent crash-restart short-circuits cleanly via the idempotency check.
+
+**`materialized_by_request_generation` semantics per path:**
+- **Trigger A (request-generation):** stored value = the observed `cfg_request_gen` (greater than `last_request_generation`). The idempotency check above uses this to suppress duplicate materialization across crashes.
+- **Trigger B (pack-change):** stored value = the current `last_request_generation` (no increment). Pack-change-driven materialization isn't tied to a specific generation; the field still anchors the "I already materialized for this state" check, just not against an explicit operator trigger.
+- **Trigger C (cancelled-forces-new):** does NOT fire on its own. Operator must bump `request-generation` to reactivate after cancellation; that becomes Trigger A.
+
+**Crash recovery example:**
+1. Operator sets `request-generation=42` (was 41).
+2. Runner reconciles: `cfg_request_gen (42) > last_request_generation (41)` → Trigger A fires.
+3. Runner mutates dynstate in-memory: `last_request_generation=42`, `current = new RequestState(materialized_by_request_generation=42, ...)`. Calls `update_dynstate(...)` per Tier-A invariant.
+4. Crash before LMDB commit completes.
+5. Restart: dynstate restored to either pre-step-3 state (`last_request_generation=41`, no current update) or post-step-3 state (`last_request_generation=42`, current.materialized_by_request_generation=42). Atomic — no in-between.
+6. Next reconciliation: if pre-step-3 state, Trigger A fires again — re-materializes the same request (idempotent because the operator's intent is unchanged). If post-step-3 state, the idempotency check at the top short-circuits — no-op.
+
+This is the round-6 codex H1 / claude r5 H1 idempotency story made concrete.
+
+### 4.1.1 `create-request` (unchanged from v3 in terms of end-user effect)
 
 ### 4.2 `execute-request` ↔ `start-generation` — auto-execute idempotency anchor (🆕 CR4_5)
 
@@ -444,7 +542,7 @@ def devname_from_swi_path(path: ttt.Path) -> str:
     return p_key.name
 ```
 
-(Cannot reuse `_DeviceTransaction.devname_from_device_path` directly — that helper expects `path: PathKey`, but our `params.path` is a `PathElem` with a PathKey parent.)
+(The closer-shaped existing helper is `devname_from_rfs_path` at `ttt.act:2042-2053`, which already walks ancestors looking for a `PathElem("rfs")`. We can't reuse it directly because (a) it lacks the namespace check our hardened version adds, and (b) it isn't part of the public substrate API. The structural pattern — walk ancestors, verify parent — is the same.)
 
 🆕 v2.0 platform ask: parameterize `_RFSTransaction.finalize`'s empty-output suppression OR thread `lower` through `RFSFunction.init_dynstate`. Either change would let sw-install move to `RFSTransform` and the platform convention realigns. Captured in §14.
 
@@ -469,30 +567,64 @@ proc def act(params: ttt.TransformActorParams) -> ?proc(gdata.Node, ?gdata.Node)
     return lambda cfg, mem: runner.on_local_config(cfg, mem)
 ```
 
-🆕 **Runner-status startup guard** (v5.1 rewrite per round-5 A2):
+🆕 **Runner-status startup guard — concrete algorithm** (v5.2 per round-6 A2):
 
-The runner publishes `runner-status` to oper. Critical fix from v5: the 5s `missing-global-config` timer starts at "first non-None on_global_config callback", **NOT** at "first on_local_config + 5s." Round-5 (claude r5 H3) caught that the platform's first `_sub_tick` fires synchronously during `declare_subscriptions` (before `Layer.load_from_db()` has populated the lower layer), delivering `None`. v5's earlier wording would false-alarm on every well-wired startup.
+Round-6 reviewers caught that v5.1's three descriptions (§7.2 prose / state diagram / YANG) were mutually inconsistent. Worse, "first non-None on_global_config" cannot detect "missing forever" because `_owner_publish` doesn't fire the cb at all when `merge_subscription_tree` returns `None` (verified vs `ttt.act:436-445, 663-672`).
+
+v5.2 algorithm — single source of truth, mirrored verbatim in the YANG `runner-status` description:
+
+```acton
+# Constants
+MISSING_GLOBAL_CONFIG_GRACE = 15.0    # seconds; >= subscription period (5s) + load_from_db budget
+
+# At runner construction (inside act callback):
+after MISSING_GLOBAL_CONFIG_GRACE: self._check_global_config_seen()
+
+action def on_global_config(merged: ?gdata.Node, err: ?Exception):
+    # Layer.declare_subscriptions only fires the cb when merge_subscription_tree
+    # returns non-None — never with a None merged tree (per ttt.act _owner_publish).
+    if merged is not None and contains_software_install_subtree(merged):
+        self.global_config_cache = parse_global_config(merged)
+        self.global_config_seen = True
+        if self.runner_status in {STARTING, MISSING_GLOBAL_CONFIG}:
+            self.runner_status = OK
+            self._publish_oper()
+
+action def _check_global_config_seen():
+    # Watchdog fires unconditionally MISSING_GLOBAL_CONFIG_GRACE seconds
+    # after construction. If global_config_seen is still False, topology is
+    # wrong (or no /software-install/ has been authored yet) — fail loud.
+    if not self.global_config_seen and self.runner_status == STARTING:
+        self.runner_status = MISSING_GLOBAL_CONFIG
+        self._publish_oper()
+
+def contains_software_install_subtree(merged: gdata.Node) -> bool:
+    # True if merged's tree includes the /software-install/ container at
+    # any depth (even if empty — operator authored the subtree but no packs
+    # yet). False if /software-install/ is genuinely absent (topology wrong).
+    ...
+```
+
+**Key correctness properties:**
+- The watchdog **always fires** (not gated on a callback that may never come) — catches "missing forever" topology errors.
+- An empty `/software-install/` container counts as "seen"; the watchdog only complains when the container is genuinely absent from the tree.
+- `global_config_seen` flips True permanently on first valid observation; subsequent observations cannot regress it.
 
 State transitions:
 
 ```
-starting          (initial — actor constructed, neither config callback has fired with non-None data)
+starting (T=0)   actor constructed; watchdog scheduled at T+15s
    │
-   │ first on_local_config(cfg!=None) AND first on_global_config(merged!=None containing /software-install/)
-   ▼
-ok                (steady state)
-
-starting / ok ──(cb sequence: on_global_config(None) repeats past 5s timeout from runner construction)──▶ missing-global-config
-                  (operator's app composition is wrong — /software-install/ is not in the lower layer)
+   ├─ T<15s, on_global_config delivers /software-install/ → ok
+   │
+   └─ T=15s, global_config_seen still False → missing-global-config
+       │
+       └─ later on_global_config delivers /software-install/ → ok
 
 ok ──(§3.5 dynstate-internal inconsistency on startup)──▶ restore-inconsistent
-
 ok / processing ──(/software-install/enabled = false)──▶ paused-by-enabled
-
 ok ──(DeviceMgr returns NoAdapter — no DMC set)──▶ waiting-for-device
 ```
-
-**"Global config seen" defined precisely** (per round-5 codex r5 HIGH 3 data semantics): the cb received a non-None `gdata.Node` whose root contains the `/software-install/` container at any depth in its merged tree. An empty `/software-install/` container counts as "seen" (operator authored the subtree but no packs yet); absent `/software-install/` does NOT count.
 
 **Precedence rules** (per CR5_2): when multiple non-`ok` states apply simultaneously, status is set to the highest-priority one:
 
@@ -541,6 +673,10 @@ def make_sw_install_transform(
 
     proc def factory(path: ttt.Path, lower: ?ttt.Layer) -> ttt.Node:
         # Per-device-transform-instance holder — function and act share it.
+        # `list[T]` is used as a single-cell mutable container because Acton
+        # has no first-class `Cell[T]`/`mut[T]` and tuples are immutable, so
+        # closures need a mutable list to share the constructed instance
+        # between function_factory and act.
         fn_holder: list[SwInstallTransform] = []
 
         def function_factory(log_handler: ?logging.Handler) -> SwInstallTransform:
@@ -556,10 +692,15 @@ def make_sw_install_transform(
                 params.update_oper,                    # proc(?gdata.Node) -> None
                 params.update_dynstate,                # proc(?gdata.Node) -> None
                 dev_registry.get(devname),
-                fn,                                    # for installing stash_cb
                 ...
             )
-            fn.stash_cb = runner._stash_dynstate       # 🆕 v5.1: action-ref push setup
+            # 🆕 v5.2 per A1: single-owner stash_cb install. The act callback
+            # runs in the same actor that owns `fn` (the Transaction actor),
+            # so this is a same-actor write — no cross-actor field mutation.
+            # `runner._stash_dynstate` is an action ref, sendable across actor
+            # boundaries; transform_wrapper later invokes it from the same
+            # Transaction actor (queues to runner mailbox).
+            fn.stash_cb = runner._stash_dynstate
             if params.lower is not None:
                 params.lower.declare_subscriptions(
                     owner_id="sw_install:" + devname,
@@ -588,8 +729,7 @@ actor DeviceRunner(
     path: ttt.Path,
     update_oper: proc(?gdata.Node) -> None,             # 🆕 CL4_1: was action(...)
     update_dynstate: proc(?gdata.Node) -> None,         # 🆕 CL4_1: was action(...)
-    dev: swdev.DeviceMgr,
-    transform_fn: SwInstallTransform,                   # for installing stash_cb (§3.6)
+    dev: swdev.DeviceMgr,                               # 🆕 v5.2 per A1: no transform_fn parameter
     local_fi: LocalFileInspector,
     remote_fi_factory: proc(swdev.DeviceMgr) -> RemoteFileInspector,
     file_transfer: ?FileTransfer,
@@ -668,7 +808,7 @@ action def _poll_device_readiness():
 
 🆕 v2.0 platform ask: `DeviceMgr.on_status_change(cb)` event-driven equivalent. Captured in §14.
 
-🆕 **`dev_registry.get(devname)` call shape** (per CL4_8): one-line check during Phase 4 skeleton — verify whether returned `DeviceMgr` is value-typed-synchronous or async-future. If async, `act()` must defer construction to a callback chain. ❓Round-5 question Q2.
+**`dev_registry.get(devname)` call shape** is **synchronous** — confirmed by precedent in `_RFSTransaction.__init__` (`ttt.act:2071`) and `testing.act:38`. The §7.2 `act()` callback uses the result synchronously without a callback chain.
 
 ---
 
@@ -690,7 +830,11 @@ action def _poll_device_readiness():
 
 ---
 
-## 10. Testing strategy (unchanged)
+## 10. Testing strategy
+
+(Mostly carried from v3.)
+
+🆕 v5.2 (per round-6 A5): **`test_topology_misconfigured.act` is a required Phase 4 test.** Builds a layer stack where `/software-install/` is NOT passed through to the layer below the sw-install transform; asserts the runner reaches `runner-status = missing-global-config` after `MISSING_GLOBAL_CONFIG_GRACE` (15s), even with a valid pack assignment in local config. Serves as the regression guard against app-integration mistakes — the only "operator can shoot foot" surface in the design. Should also serve as a copy-paste template for app integrators showing the correct vs incorrect topologies side by side.
 
 ---
 
@@ -770,8 +914,10 @@ action def _poll_device_readiness():
 
 ---
 
-## 16. Round-5 review
+## 16. Round-7 review
 
-This v5 design integrates all round-4 feedback. Both reviewers' five HIGH-priority items (lifecycle/D3a-broken, Tier A unimplementable, scp-port sibling visibility, subscription-wiring footgun, action vs proc type) are addressed. v5 unblocks Phase 4 with no platform prerequisites; round-3's "platform addition required" is gone.
+v5.2 integrates round-6 feedback: action-ref stash single-owner installation, concrete missing-global-config algorithm, §4.1 reconciliation pseudocode with `materialized_by_request_generation` semantics, FIFO-mailbox-with-empty-restore-signal pattern, required topology-misconfigured integration test, plus stale-text and citation cleanups.
 
-**Stop here for round-5 review.** Both reviewers will be re-briefed against the full revised doc set (`00-orientation.md`, `01-software-install-logic.md`, `02-sw-install-design.md` v5, `docs/adr/cli-driver.md`, `yang.act` v5) with no carry-over context.
+Both round-6 reviewers' verdict was "green-light Phase 4 after these fixes." v5.2 lands them.
+
+**Stop here for round-7 lock-in review.** Both reviewers will be re-briefed against the full revised doc set with no carry-over context. Convergence trajectory (HIGH count 6 → 5 → 3+3 → 2+2) suggests round 7 finds 0-1 items.
