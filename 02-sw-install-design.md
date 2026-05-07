@@ -1,6 +1,6 @@
-# 02 — Stratoweave `software-install` Module Design (v5.3)
+# 02 — Stratoweave `software-install` Module Design (v5.3.1 — LOCKED IN)
 
-> **Status: v5.3 — incorporates round-7 review feedback from `docs/reviews/18-codex-design-r7.md` and `docs/reviews/19-claude-design-r7.md`, integrated in `docs/reviews/20-integration-r7.md`. Both r7 reviewers' verdict: "green-light Phase 4 after these fixes." 1+1 HIGHs (different items: codex caught a §4.1 algorithm bug, claude caught a §7.2 stale snippet) plus a few small cleanups. Convergence trajectory across rounds: HIGH count 6 → 5 → 3+3 → 2+2 → 1+1. Pending round-8 lock-in.**
+> **Status: v5.3.1 — LOCKED IN for Phase 4 implementation. Round-8 (`docs/reviews/21-codex-design-r8.md` + `docs/reviews/22-claude-design-r8.md`) produced ZERO HIGH findings and convergent 1 MED + 2 LOWs across both reviewers — landed in v5.3.1 as a polish pass (§3.7 prose alignment, §7.3 file_transfer_factory(dev, dmc) spelling, version labels). Both r8 reviewers explicitly: "Green-light Phase 4." Convergence trajectory: HIGH count 6 → 5 → 3+3 → 2+2 → 1+1 → 0+0 across 8 review rounds.**
 
 > **No platform-side prerequisites required for Phase 4 implementation** (down from v4's "platform addition required"). v5 promoted the `transform_wrapper`-stash dynstate-restore path to primary because actor construction runs before `Layer.load_from_db()` in the live lifecycle — so the originally-proposed `TransformActorParams.dynstate` field would be `None` at construction even if added. The stash path leverages the existing post-restore recompute and works without platform changes. See §3.6.
 
@@ -322,7 +322,7 @@ This means `_stash_dynstate` is **always called** before any `on_local_config`, 
   - `last_clear_run_log_generation` — re-fire empties an already-empty log. Safe.
   - `last_confirm_all_generation` — re-fire stamps the same confirmations. Safe.
   - 🆕 `last_request_generation` — **NOT idempotent by design** (request-generation explicitly forces a new request even on identical pack data). v5.1 adds an explicit anchor (see below).
-- 🆕 **`current.materialized_by_request_generation: u64`** (per round-5 codex H1) — when a new request is materialized in response to `request-generation`, this field on `RequestState` records which generation triggered it. The §4.1 reconciliation rule becomes: "if the trigger's `request-generation` value equals the current request's `materialized_by_request_generation`, the current request already corresponds to this trigger — no-op." This makes `request-generation` re-fire-safe across crash+restart.
+- 🆕 **`current.materialized_by_request_generation: u64`** (per round-5 codex H1; **v5.3 wording correction per round-8 reviewers**) — when a new request is materialized in response to `request-generation`, this field on `RequestState` records which generation triggered it. The §4.1 reconciliation rule (verbatim): "if `current.materialized_by_request_generation == cfg_request_gen` AND `target_pack == last_pack_snapshot`, the current request already corresponds to this trigger and pack snapshot — no-op; otherwise allow Trigger A or Trigger B (pack-change) to materialize." Both conditions are required: a same-generation-but-changed-pack situation must NOT short-circuit, because the operator's pack-data change is a legitimate reason to materialize a new request even without bumping `request-generation`. This makes `request-generation` re-fire-safe across crash+restart while preserving Trigger B for pack-data changes.
 - `next_request_id` — publish in the same snapshot as the new request being added to history. Re-fire would have already had the new request visible.
 - `current.error_count.{transient,other,backoff}`, `current.next_wake_at` — publish before scheduling `after backoff: _start_run`. Re-fire schedules another `after`; the in-memory `after` is lost on restart, so the new schedule is correct.
 - `auto_started_after_confirm: True` (🆕 CR4_5) — publish in the same snapshot as `current.status = processing` (per the v5.1 batching invariant above). A crash either leaves both written or both unwritten; re-fire on restart sees the snapshot consistently and proceeds correctly.
@@ -713,18 +713,26 @@ def make_sw_install_transform(
         proc def act(params: ttt.TransformActorParams) -> ?proc(gdata.Node, ?gdata.Node) -> None:
             fn = fn_holder[0]                          # the same instance used by transform_wrapper
             devname = devname_from_swi_path(params.path)
+            dev = dev_registry.get(devname)
+            # 🆕 v5.3.1 per round-8 LOW 1: file_transfer_factory's signature is
+            # proc(swdev.DeviceMgr, DeviceMetaConfig) -> FileTransfer (per §1
+            # public API). DMC comes from the existing DeviceMgr.get_dmc()
+            # API (§9.5; verified at device.act:401). Read DMC once at
+            # FileTransfer construction; if the FileTransfer impl needs fresh
+            # creds per transfer (DMC is mutable via repeated set_dmc(...)),
+            # it should call dev.get_dmc() inside its put/delete methods —
+            # see §9.5 for the use-time-not-construction-time discipline.
+            ft = file_transfer_factory(dev, dev.get_dmc()) if file_transfer_factory is not None else NoopFileTransfer()
             runner = DeviceRunner(
                 params.path,
                 params.update_oper,                    # proc(?gdata.Node) -> None
                 params.update_dynstate,                # proc(?gdata.Node) -> None
-                dev_registry.get(devname),
-                # Remaining args (local_fi, remote_fi_factory, file_transfer,
-                # ops_factory, cli_session_factory, log_handler) are closed
-                # over from make_sw_install_transform's outer scope and
-                # passed positionally per §8.2's DeviceRunner signature.
+                dev,
+                # Remaining args closed over from make_sw_install_transform's
+                # outer scope, passed positionally per §8.2's DeviceRunner sig.
                 local_file_inspector or default_local_fi(file_cap),
                 remote_file_inspector_factory or default_remote_fi_factory,
-                file_transfer_factory and file_transfer_factory(...) or NoopFileTransfer(),
+                ft,
                 ops_factory_for(devname),              # selected by device OS, see §9.7
                 cli_session_factory,
                 log_handler,
@@ -949,10 +957,20 @@ action def _poll_device_readiness():
 
 ---
 
-## 16. Round-8 review
+## 16. LOCK-IN
 
-v5.3 integrates round-7 feedback: §4.1 idempotency check rescoped to require pack equality (codex r7 H1 algorithm bug fix), §7.2 stale `transform_fn` snippet replaced with reference to §7.3 single source (claude r7 H1), §3.6/§8.4 lifecycle prose corrected for per-list-entry construction (claude r7 MED 1), §3.6.1 substitution note for _signal_no_restore, §7.3 elided factory args spelled out, §7.2 _owner_publish prose tightened, §2 5-second→15-second reference fix, stale _signal_no_restore comments removed.
+v5.3.1 is the lock-in version. Round-8 review produced zero HIGH findings; both reviewers (codex r8, claude r8) independently surfaced the same 1 MED + 2 LOW items, all of which v5.3.1 lands. Both reviewers' verdict: **"Green-light Phase 4."** No further design iteration is warranted.
 
-Both round-7 reviewers' verdict was "green-light Phase 4 after these fixes." v5.3 lands them.
+**Convergence trajectory across 8 review rounds (HIGH count, codex+claude):**
+```
+r3: 6
+r4: 5
+r5: 3+3
+r6: 2+2
+r7: 1+1 (different items per reviewer; both real)
+r8: 0+0 (zero HIGHs; matched 1 MED + 2 LOWs)
+```
 
-**Stop here for round-8 lock-in review.** Round-7 found 1+1 HIGHs (different items, both real). Round-8 expectation: zero findings or 1 cosmetic item — if so, lock in and start Phase 4. Otherwise iterate v5.4.
+This is the strongest convergence signal achievable: independent reviewers, fresh context each round, all items addressed, both green-lit.
+
+**Phase 4 implementation can start.** The next concrete step is `acton build` of the `stratoweave/sw-install/` scaffold + first TDD cycle (`pack.act` + `test_pack.act`). See §11 for the implementation phasing within Phase 4.
